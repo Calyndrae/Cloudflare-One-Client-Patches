@@ -9,13 +9,26 @@ through the fallback ports and never completes.  Re-registering the device
 fixes it.  The script also has a service-restart fallback and a final
 network diagnosis if nothing works.
 
+The other failure this handles is the one the first version of this script
+could cause: warp-cli talks to the WARP service over a local IPC socket, and
+while the service is grinding through a connect attempt it stops answering.
+Registration commands sent into that window come back with "The IPC call hit a
+timeout" *after* they have already half-applied, which can leave the device
+with no registration at all - a worse problem than the one it came here with.
+So the daemon is always quiesced before registration is touched, those calls
+are retried, and a device that ends up unregistered is re-registered before
+the script gives up.
+
 Your settings are left alone.  The tunnel protocol (MASQUE / WireGuard) and
 the WARP mode are read before the device is re-registered and put back
-afterwards if re-registration reset them.  Nothing else is changed.
+afterwards if re-registration reset them.  Nothing else is changed unless you
+pass --try-protocols.
 
 Usage:
-    python warp_fix.py            (auto-prompts for admin via UAC)
-    python warp_fix.py --no-pause (don't wait for Enter at the end)
+    python warp_fix.py                 (auto-prompts for admin via UAC)
+    python warp_fix.py --no-pause      (don't wait for Enter at the end)
+    python warp_fix.py --try-protocols (also try the other tunnel protocol,
+                                        and put yours back if it doesn't help)
 
 Build a standalone self-elevating EXE (on a machine with Python):
     pip install pyinstaller
@@ -46,6 +59,28 @@ WARP_EDGE_IP = "162.159.198.2"
 API_HOST = "api.cloudflareclient.com"
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 CONNECT_WAIT = 30          # seconds to wait for "Connected" after each attempt
+QUIESCE_WAIT = 25          # seconds to wait for the daemon to leave "Connecting"
+
+# warp-cli reaches the WARP service over a local IPC socket.  These are what it
+# prints when the service is too busy connecting to answer - the command has
+# not necessarily failed, it just never got a reply, so it is worth retrying
+# once the daemon is idle rather than treating it as a hard error.
+IPC_BUSY_RE = re.compile(r"IPC call hit a timeout|Error communicating with daemon",
+                         re.I)
+
+# Sent as one UDP datagram each in the final diagnosis.  WARP's tunnel is UDP
+# only, so TCP/443 succeeding says nothing useful; these say everything.
+# Cloudflare serves MASQUE (QUIC) on 443 and falls back to 500/1701/4500, which
+# is exactly the port ladder a stuck client cycles through, so a QUIC probe on
+# each of them mirrors what the client itself is attempting.
+UDP_PROBES = [
+    ("1.1.1.1", 53, "dns", "any UDP at all?"),
+    ("1.1.1.1", 443, "quic", "UDP/443 in general"),
+    (WARP_EDGE_IP, 443, "quic", "WARP edge, main port"),
+    (WARP_EDGE_IP, 500, "quic", "WARP edge, fallback"),
+    (WARP_EDGE_IP, 1701, "quic", "WARP edge, fallback"),
+    (WARP_EDGE_IP, 4500, "quic", "WARP edge, fallback"),
+]
 
 # Tunnel protocols warp-cli understands, keyed by lowercase name so that
 # whatever casing the CLI prints maps back onto a value it will accept.
@@ -72,6 +107,7 @@ MODE_ALIASES = {
 }
 NO_PAUSE = "--no-pause" in sys.argv
 NO_ELEVATE = "--no-elevate" in sys.argv
+TRY_PROTOCOLS = "--try-protocols" in sys.argv
 
 LOG_PATH = os.path.join(os.environ.get("TEMP", "."), "warp_fix.log")
 _log_fh = None
@@ -153,9 +189,57 @@ class Warp:
     def cmd(self, *args, timeout=60):
         return run([self.cli, "--accept-tos", *args], timeout=timeout)
 
+    @staticmethod
+    def ipc_busy(out):
+        """Did the service fail to answer, rather than answer with a failure?"""
+        return bool(out) and IPC_BUSY_RE.search(out) is not None
+
+    def cmd_retry(self, *args, attempts=3, timeout=60, settle=4):
+        """cmd(), but retried while the service is too busy to reply.
+
+        Only IPC timeouts are retried - a real error from the service is
+        returned as-is on the first try.  Between attempts we ask WARP to stop
+        connecting, because the connect loop is what is monopolising it."""
+        rc, out = -1, ""
+        for attempt in range(1, attempts + 1):
+            rc, out = self.cmd(*args, timeout=timeout)
+            if not self.ipc_busy(out):
+                return rc, out
+            if attempt < attempts:
+                log("   (WARP service busy - stopping the connect attempt and "
+                    "retrying '%s' in %ss)" % (" ".join(args), settle))
+                self.cmd("disconnect", timeout=15)
+                time.sleep(settle)
+                settle *= 2
+        return rc, out
+
     def status(self):
         _, out = self.cmd("status", timeout=20)
         return out
+
+    def state(self, out=None):
+        """The one-word state WARP reports: Connected / Connecting /
+        Disconnected / Unable / None if it will not say."""
+        out = self.status() if out is None else out
+        m = re.search(r"Status update:\s*(\w+)", out or "")
+        return m.group(1) if m else None
+
+    def quiesce(self, seconds=QUIESCE_WAIT):
+        """Stop WARP connecting and wait until it has actually stopped.
+
+        This is the important one.  A registration command issued while the
+        daemon is mid-connect gets no reply, and warp-cli reporting an IPC
+        timeout does not mean the daemon ignored it - `registration delete` can
+        land anyway and leave the device unregistered.  Nothing touches
+        registration until this returns True."""
+        self.cmd("disconnect", timeout=20)
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            st = self.state()
+            if st and st.lower() != "connecting":
+                return True
+            time.sleep(2)
+        return False
 
     def is_connected(self, out=None):
         out = self.status() if out is None else out
@@ -191,6 +275,23 @@ class Warp:
             info["license"] = m.group(1)
         return info
 
+    def registration_present(self):
+        """True / False, or None when the service will not tell us.
+
+        None is treated as "leave it alone" everywhere: registering a device
+        that already has a registration is its own kind of mess, so we only act
+        on a definite no."""
+        rc, out = self.cmd("registration", "show", timeout=20)
+        if re.search(r"Registration Missing|Missing Registration|"
+                     r"not registered|No registration", out or "", re.I):
+            return False
+        if rc == 0 and re.search(r"Device ID|Public Key|Account ID|"
+                                 r"Account type|Registration ID", out or "", re.I):
+            return True
+        if re.search(r"Registration Missing", self.status() or "", re.I):
+            return False
+        return None
+
     # --- settings we must not change -------------------------------------- #
     def settings_text(self):
         _, out = self.cmd("settings", timeout=20)
@@ -219,9 +320,19 @@ class Warp:
         return rc == 0, out
 
     def mode(self):
-        """Current WARP mode as warp-cli spells it, or None if unknown."""
-        m = re.search(r"^\s*Mode\s*[:=]\s*(\S+)", self.settings_text(), re.M)
-        return m.group(1).strip(".,") if m else None
+        """Current WARP mode as warp-cli spells it, or None if unknown.
+
+        How `warp-cli settings` labels the mode has moved around between
+        releases, so try the spellings we have seen.  Failing to read it costs
+        nothing: an unknown mode is never written back."""
+        text = self.settings_text()
+        for pat in (r"^\s*Mode\s*[:=]\s*(\S+)",
+                    r"^\s*WARP mode\s*[:=]\s*(\S+)",
+                    r"^\s*Tunnel mode\s*[:=]\s*(\S+)"):
+            m = re.search(pat, text, re.M | re.I)
+            if m:
+                return m.group(1).strip(".,")
+        return None
 
     def set_mode(self, mode):
         short = MODE_ALIASES.get(mode.lower().replace(" ", ""))
@@ -335,6 +446,78 @@ def tcp_ok(host, port=443, timeout=5):
         return False
 
 
+def udp_probe(host, port, kind, timeout=4):
+    """Send one UDP datagram that a healthy server is obliged to answer.
+
+    "dns"  - a real DNS query for cloudflare.com; a reply carrying our
+             transaction id means UDP got out and back.
+    "quic" - a QUIC long header carrying version 0x0a0a0a0a, which no server
+             implements.  RFC 9000 requires the server to answer with a
+             Version Negotiation packet, so we learn whether UDP reaches the
+             port without having to speak the rest of QUIC.  The datagram is
+             padded to 1200 bytes because servers ignore shorter ones.
+
+    Returns True (answered), False (silence) or None (the send itself failed).
+    """
+    if kind == "dns":
+        txid = os.urandom(2)
+        payload = (txid + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+                   + b"\x0acloudflare\x03com\x00\x00\x01\x00\x01")
+        expect = txid
+    else:
+        dcid, scid = os.urandom(8), os.urandom(8)
+        payload = (b"\xc0\x0a\x0a\x0a\x0a"
+                   + bytes([len(dcid)]) + dcid + bytes([len(scid)]) + scid)
+        payload += b"\x00" * (1200 - len(payload))
+        expect = None
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        sock.sendto(payload, (host, port))
+        data, _ = sock.recvfrom(2048)
+        return expect is None or data[:2] == expect
+    except socket.timeout:
+        return False
+    except OSError:
+        return None
+    finally:
+        if sock is not None:
+            sock.close()
+
+
+def udp_diagnosis():
+    """Probe the ports WARP's tunnel actually needs. Returns a verdict key."""
+    log("UDP reachability - this is the one that matters, WARP's tunnel is UDP:")
+    results = []
+    for host, port, kind, note in UDP_PROBES:
+        answered = udp_probe(host, port, kind)
+        word = {True: "reply", False: "no reply",
+                None: "no route / refused"}[answered]
+        log("  UDP %-4s to %-15s (%-20s) : %s" % (port, host, note, word))
+        results.append((host, port, answered))
+
+    edge_ok = any(a for h, _, a in results if h == WARP_EDGE_IP)
+    quic_ok = any(a for h, p, a in results if p != 53)
+    dns_ok = any(a for _, p, a in results if p == 53)
+
+    log()
+    if edge_ok:
+        log("  -> UDP does reach Cloudflare's WARP edge, so this network is not")
+        log("     what is blocking the tunnel. Suspect something on this PC:")
+        log("     another VPN's filter driver, or a broken registration.")
+        return "edge-ok"
+    if quic_ok or dns_ok:
+        log("  -> UDP leaves this network, but nothing comes back from the WARP")
+        log("     edge. Something here is filtering VPN traffic specifically")
+        log("     (school / office / hotel networks and some ISPs do this).")
+        return "edge-filtered"
+    log("  -> No UDP reply from anywhere, not even a plain DNS query. This")
+    log("     network blocks outbound UDP, and WARP's tunnel is UDP only, so")
+    log("     no setting on this computer can get through it.")
+    return "udp-blocked"
+
+
 def trace_check():
     """Ask Cloudflare whether traffic is going through WARP. Returns dict or None."""
     try:
@@ -349,9 +532,13 @@ def trace_check():
 
 def network_diagnosis(warp):
     step("Network diagnosis (WARP still not connecting)")
-    log("TCP 443 to WARP edge %s : %s" % (WARP_EDGE_IP, "OK" if tcp_ok(WARP_EDGE_IP) else "BLOCKED"))
-    log("TCP 443 to %-22s : %s" % (API_HOST, "OK" if tcp_ok(API_HOST) else "BLOCKED"))
-    log("TCP 443 to 1.1.1.1              : %s" % ("OK" if tcp_ok("1.1.1.1") else "BLOCKED"))
+    log("TCP 443 - the control plane. WARP signs in over this, but the tunnel")
+    log("does not use it, so an OK here does not mean the tunnel can work:")
+    log("  TCP 443 to WARP edge %s : %s" % (WARP_EDGE_IP, "OK" if tcp_ok(WARP_EDGE_IP) else "BLOCKED"))
+    log("  TCP 443 to %-22s : %s" % (API_HOST, "OK" if tcp_ok(API_HOST) else "BLOCKED"))
+    log("  TCP 443 to 1.1.1.1              : %s" % ("OK" if tcp_ok("1.1.1.1") else "BLOCKED"))
+    log()
+    verdict = udp_diagnosis()
     log()
     log("Last status:")
     for l in warp.status().splitlines():
@@ -359,21 +546,43 @@ def network_diagnosis(warp):
     log()
     proto = warp.tunnel_protocol()
     mode = warp.mode()
-    log("Tunnel protocol: %s   |   Mode: %s"
-        % (proto or "(unknown)", mode or "(unknown)"))
+    registered = warp.registration_present()
+    log("Tunnel protocol: %s   |   Mode: %s   |   Registered: %s"
+        % (proto or "(unknown)", mode or "(unknown)",
+           {True: "yes", False: "NO", None: "(unknown)"}[registered]))
     log()
     log("Things to try next:")
-    log("  * Connect to a different network (e.g. phone hotspot). If WARP works")
-    log("    there, this network is blocking UDP/VPN traffic and no client-side")
-    log("    fix will help.")
-    log("  * Uninstall other VPN / proxy tools (Clash, v2ray, Radmin VPN, ...)")
-    log("    and reboot - their filter drivers can block the WARP tunnel.")
+
+    if verdict == "udp-blocked":
+        log("  * THIS IS THE BLOCKER: the network drops outbound UDP. Move to a")
+        log("    different one - a phone hotspot is the quickest test. If WARP")
+        log("    connects there, nothing was ever wrong with this computer.")
+        log("  * If it is your own router, look for a UDP/QUIC or 'VPN")
+        log("    passthrough' setting and allow UDP out on 443 and 2408.")
+    elif verdict == "edge-filtered":
+        log("  * THIS IS THE BLOCKER: UDP works, but not to Cloudflare's WARP")
+        log("    edge. That is deliberate filtering by whoever runs this")
+        log("    network. A phone hotspot will confirm it in under a minute.")
+    else:
+        log("  * Uninstall other VPN / proxy tools (Clash, v2ray, Radmin VPN,")
+        log("    ...) and reboot - their filter drivers can block the tunnel")
+        log("    even while they look switched off.")
+        log("  * Connect to a different network (e.g. phone hotspot) to rule the")
+        log("    network in or out.")
+
     if proto:
         other = "WireGuard" if proto.lower() == "masque" else "MASQUE"
         log("  * Some networks pass one tunnel protocol and block the other. You")
-        log("    are on %s; switching to %s in the WARP app (Settings >" % (proto, other))
-        log("    Advanced > Connection options) may get you through. This tool")
-        log("    deliberately does not change that setting for you.")
+        log("    are on %s. Re-run this tool with --try-protocols to let it try" % proto)
+        log("    %s and put %s straight back if that does not help, or switch" % (other, proto))
+        log("    by hand in the app: Settings > Advanced > Connection options.")
+        log("    Without that flag the tool never touches this setting.")
+    if registered is False:
+        log("  * This device currently has NO WARP registration, so the app will")
+        log("    show its first-run screen. Pick the LEFT card (1.1.1.1 /")
+        log("    private browsing) unless your workplace or school gave you a")
+        log("    Cloudflare One team name - the right-hand card asks for that")
+        log("    team login and cannot be used without one.")
     log("  * Reinstall WARP from https://1.1.1.1/ and run this script again.")
     log("  * Full log: %s" % LOG_PATH)
 
@@ -387,8 +596,64 @@ def attempt_plain_connect(warp):
     return warp.wait_connected(20)
 
 
-def attempt_reregister(warp, snap):
-    step("Step 2/3: re-register device (fixes expired registration)")
+def register_new(warp, timeout=90):
+    """`registration new`, falling back to the older CLI's `register`."""
+    rc, out = warp.cmd_retry("registration", "new", timeout=timeout)
+    if re.search(r"unrecognized subcommand|unexpected argument|invalid subcommand",
+                 out or "", re.I):
+        rc, out = warp.cmd_retry("register", timeout=timeout)
+    return rc, out
+
+
+def ensure_registration(warp):
+    """Never hand the machine back in a worse state than we found it.
+
+    A registration command that the service never acknowledged can still have
+    landed, so a run that fails can leave the device with no registration at
+    all.  WARP then reports "Registration Missing" and the app falls back to
+    its first-run screen - a worse problem than the stuck connect this tool
+    came to fix.  So we try harder for a registration than for the connection
+    itself, and say exactly how to get one back if we cannot."""
+    if warp.registration_present() is not False:
+        return True
+    if getattr(warp, "repair_failed", False):
+        log("(Still unregistered - see the repair section above.)")
+        return False
+
+    step("Repair: this device has been left without a WARP registration")
+    log("Nothing can connect without one, so this gets fixed before we give up.")
+    for attempt in (1, 2):
+        warp.quiesce()
+        rc, out = register_new(warp)
+        log("registration new -> %s" % (out or rc))
+        if warp.registration_present() is not False:
+            log("Registration restored.")
+            return True
+        if attempt == 1:
+            log("Restarting the WARP service and trying once more ...")
+            restart_service()
+
+    log("!! Could not register this device again - Cloudflare's API is not")
+    log("   reachable from this network.")
+    log("   Once you are on a network that works, either open the WARP app and")
+    log("   answer its first-run screen, or run this one line as administrator:")
+    log('     "%s" --accept-tos registration new' % warp.cli)
+    warp.repair_failed = True
+    return False
+
+
+def attempt_reregister(warp, snap, delete_first=True):
+    step("Step 2/3: re-register device (fixes an expired or missing registration)")
+
+    # The service stops answering while it is grinding through a connect
+    # attempt, and a registration command sent into that window can half-apply
+    # - which is how a device ends up unregistered. Stop the loop first.
+    if not warp.quiesce():
+        log("WARP is still stuck in its connect loop; restarting the service to")
+        log("get its attention before touching the registration.")
+        restart_service()
+        warp.quiesce()
+
     info = warp.registration_info()
     acct = info["account_type"] or "unknown"
     lic = info["license"]
@@ -398,18 +663,18 @@ def attempt_reregister(warp, snap):
     else:
         lic = None
 
-    warp.cmd("disconnect")
-    time.sleep(1)
-    rc, out = warp.cmd("registration", "delete")
-    log("registration delete -> %s" % (out or rc))
-    time.sleep(2)
-    rc, out = warp.cmd("registration", "new", timeout=90)
+    if delete_first:
+        rc, out = warp.cmd_retry("registration", "delete")
+        log("registration delete -> %s" % (out or rc))
+        time.sleep(2)
+
+    rc, out = register_new(warp)
     log("registration new    -> %s" % (out or rc))
-    if rc != 0 or "Success" not in out:
+    if warp.registration_present() is False:
         log("!! Registration failed. WARP's API may be unreachable from this network.")
         return False
     if lic:
-        rc, out = warp.cmd("registration", "license", lic, timeout=60)
+        rc, out = warp.cmd_retry("registration", "license", lic, timeout=60)
         log("re-apply license    -> %s" % (out or rc))
     # A fresh registration can come back on WARP's defaults - put the user's
     # own tunnel protocol and mode back rather than leaving ours in place.
@@ -424,8 +689,43 @@ def attempt_service_restart(warp):
     if not restart_service():
         log("!! Service did not come back up.")
         return False
+    # A restart on a device whose registration went missing will just fail
+    # again with "Registration Missing due to: Daemon Startup", so get one
+    # back first.
+    ensure_registration(warp)
     warp.cmd("connect")
     return warp.wait_connected()
+
+
+def attempt_other_protocol(warp, snap):
+    """Only ever runs with --try-protocols, and puts the user's choice back."""
+    step("Extra step: try the other tunnel protocol (--try-protocols)")
+    current = warp.tunnel_protocol()
+    if not current:
+        log("Cannot read the current tunnel protocol, so it will not be changed.")
+        return False
+    other = "WireGuard" if current.lower() == "masque" else "MASQUE"
+    log("Some networks pass one protocol and block the other.")
+    log("Switching %s -> %s. If it does not connect, %s goes straight back."
+        % (current, other, current))
+
+    warp.quiesce()
+    ok, out = warp.set_tunnel_protocol(other)
+    if not ok:
+        log("Could not switch protocol: %s" % (out or "failed"))
+        return False
+
+    warp.cmd("connect")
+    if warp.wait_connected():
+        log("Connected on %s - leaving it there." % other)
+        log("Change it back any time in Settings > Advanced > Connection options.")
+        snap["protocol"] = other      # this one was asked for, so keep it
+        return True
+
+    log("%s did not connect either - restoring %s." % (other, current))
+    warp.quiesce()
+    warp.set_tunnel_protocol(current)
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -489,12 +789,21 @@ def main():
     # Read the settings we must hand back unchanged before touching anything.
     snap = warp.snapshot_settings()
 
+    registered = warp.registration_present()
+    if registered is False:
+        log("Registration: MISSING - this device is not registered with WARP.")
+    elif registered:
+        log("Registration: present")
+
     connected = warp.is_connected(st)
     if connected:
         log("Already connected - will just verify below.")
     else:
-        # If the registration is expired or missing, skip straight to re-register.
-        if expired is not False:
+        if registered is False:
+            # Nothing to delete, and deleting nothing errors - register fresh.
+            connected = attempt_reregister(warp, snap, delete_first=False)
+        elif expired is not False:
+            # Expired or unreadable registration: go straight to re-registering.
             connected = attempt_reregister(warp, snap)
         else:
             connected = attempt_plain_connect(warp)
@@ -502,12 +811,20 @@ def main():
                 connected = attempt_reregister(warp, snap)
         if not connected:
             connected = attempt_service_restart(warp)
+        if not connected and TRY_PROTOCOLS:
+            connected = attempt_other_protocol(warp, snap)
         if not connected:
             warp.restore_settings(snap)
+            # Whatever else failed, do not walk away from an unregistered device.
+            ensure_registration(warp)
 
     if not connected:
         network_diagnosis(warp)
         log()
+        if warp.registration_present() is False:
+            log("RESULT: NOT FIXED - and this device has no WARP registration.")
+            log("        See the 'Repair' section above before anything else.")
+            return 4
         log("RESULT: NOT FIXED")
         return 2
 

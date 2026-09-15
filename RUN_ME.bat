@@ -16,6 +16,7 @@ set "REPO_RAW=https://raw.githubusercontent.com/Calyndrae/Cloudflare-One-Client-
 set "PY_VERSION=3.13.7"
 set "SELF=%~f0"
 set "SELFDIR=%~dp0"
+set "SELFARGS=%*"
 
 echo.
 echo   ======================================================
@@ -33,8 +34,16 @@ if not errorlevel 1 goto :is_admin
 echo   Windows is about to ask if this app can make changes to
 echo   your device. Click YES.
 echo.
+if defined SELFARGS goto :elevate_with_args
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "Start-Process -FilePath $env:SELF -Verb RunAs -WorkingDirectory $env:SELFDIR" >nul 2>&1
+goto :elevate_done
+
+:elevate_with_args
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "Start-Process -FilePath $env:SELF -Verb RunAs -ArgumentList $env:SELFARGS -WorkingDirectory $env:SELFDIR" >nul 2>&1
+
+:elevate_done
 if errorlevel 1 (
     echo.
     echo   !! Administrator rights were refused, so nothing was changed.
@@ -106,9 +115,34 @@ echo.
 rem --------------------------------------------------------------------------
 rem  4. Run it (we are already elevated, so tell it not to ask again)
 rem --------------------------------------------------------------------------
-"%PYCMD%" %PYARGS% "%SCRIPT%" --no-elevate --no-pause
+set "EXTRA="
+
+:run_fix
+"%PYCMD%" %PYARGS% "%SCRIPT%" --no-elevate --no-pause %EXTRA% %SELFARGS%
 set "RC=%errorlevel%"
 
+rem  Exit code 2 means "not fixed, but the machine is in one piece". The last
+rem  thing left to try is the other tunnel protocol, and that is the user's
+rem  call to make - so ask, rather than changing it behind their back. The
+rem  script puts their protocol back if the other one does not connect either.
+if not "%RC%"=="2" goto :done
+if defined EXTRA goto :done
+echo %SELFARGS% | find /i "--try-protocols" >nul
+if not errorlevel 1 goto :done
+echo.
+echo   One thing is left to try: WARP can tunnel over MASQUE or over
+echo   WireGuard, and some networks allow one but block the other.
+echo   Your current setting is put straight back if the other one does
+echo   not connect either.
+echo.
+set "ANSWER="
+set /p "ANSWER=  Try the other tunnel protocol now? [y/N] "
+if /i not "%ANSWER%"=="y" goto :done
+set "EXTRA=--try-protocols"
+echo.
+goto :run_fix
+
+:done
 echo.
 pause
 exit /b %RC%
