@@ -6,6 +6,10 @@ They fix the client without touching your settings — your tunnel protocol
 all left exactly as you had them, and a run that fails leaves your device no
 worse off than it found it.
 
+Anything that *does* change something else on your PC — switching tunnel
+protocol, or clearing other VPN software out of the way — is asked first and
+can be undone.
+
 Right now there is one tool:
 
 | Tool | What it fixes |
@@ -109,15 +113,23 @@ When it's done, look near the bottom of the black window:
   a list of things to try. Have a look at
   [What if it didn't work?](#-what-if-it-didnt-work) below.
 
-If it says `NOT FIXED`, it then asks you one question:
+If it says `NOT FIXED`, it may then ask you one of two questions. Both change
+something on your PC, which is exactly why they are questions — press Enter on
+its own to say no, and nothing happens.
+
+> `Clear them out of the way now? [y/N]`
+
+You get this one when it found **other VPN or proxy software** holding the
+tunnel open — Clash, v2ray, Radmin VPN and friends. Answering **`y`** stops
+those programs, switches off their tunnel adapters and clears your system
+proxy. See [Can I undo the cleanup?](#-can-i-undo-the-cleanup) — the short
+answer is yes, completely.
 
 > `Try the other tunnel protocol now? [y/N]`
 
 WARP can tunnel two different ways (**MASQUE** and **WireGuard**) and some
-networks allow one but block the other, so this is genuinely worth a try. Type
-**`y`** and press Enter to let it try; your own setting is put straight back if
-the other one doesn't connect either. Press Enter on its own to say no. The
-tool never touches that setting unless you answer yes.
+networks allow one but block the other. Answering **`y`** tries the other one;
+your own setting is put straight back if it doesn't connect either.
 
 Then press **Enter** to close the window.
 
@@ -199,6 +211,49 @@ shut. Exit from the tray or uninstall, **then reboot**, then try WARP again.
 Antivirus with its own firewall (McAfee — often preinstalled on new laptops —
 Norton, 360, 火绒) can do the same thing, and won't show up as an adapter.
 
+### 🧹 Or let it clear them for you
+
+Answer **`y`** to `Clear them out of the way now?`, or run
+`RUN_ME.bat --clean-tun` yourself. It then:
+
+- stops the proxy processes it found,
+- switches off their tunnel adapters,
+- clears the Windows and WinHTTP proxy settings,
+- flushes the DNS cache,
+
+and carries on with the repair on a clear machine.
+
+**What it deliberately won't touch:** corporate VPN clients — AnyConnect,
+FortiClient, EasyConnect, GlobalProtect, Sangfor. They're listed in the report
+so you can see them, but switching one off can cut you out of your work
+network, and that's not this tool's decision to make. Turn those off yourself
+if you want them tested.
+
+**It is not a *complete* clean, and it doesn't claim to be.** These programs
+install a driver that sits below the network stack, and only uninstalling the
+program removes it. Switching off the adapter stops it carrying your traffic —
+which is what WARP needs — but for a truly clean machine, uninstall the app and
+reboot.
+
+### ↩️ Can I undo the cleanup?
+
+Yes — all of it.
+
+```powershell
+RUN_ME.bat --restore-tun
+```
+
+Everything is written to `C:\ProgramData\warp_fix\clean_tun_undo.json`
+*before* anything changes, so it can be put back even if the tool is killed
+half way. Adapters are re-enabled and your proxy settings restored exactly as
+they were.
+
+Two things to know:
+
+- **Programs it stopped are not restarted.** Launch them yourself.
+- **If the cleanup takes your PC off the internet, it undoes itself on the
+  spot** without waiting to be asked, and tells you it did.
+
 ---
 
 ## 🆘 Help, WARP says "Registration Missing"
@@ -247,6 +302,12 @@ mode before it starts, and if re-registering resets them it puts your own
 values straight back. The **one** exception is the protocol question it asks
 you after a failed run — and even then, if the other protocol doesn't connect,
 yours is restored before the tool exits.
+
+**Will `--clean-tun` break my proxy setup?**
+It switches things off; it doesn't uninstall or delete anything. Your config
+files, subscriptions and rules are untouched. `--restore-tun` re-enables the
+adapters and restores the proxy settings; the programs themselves you just
+launch again.
 
 **The app is asking me to choose between "Private browsing" and "Cloudflare
 One Client". Which one?**
@@ -305,6 +366,7 @@ The script runs this ladder and stops at the first thing that works:
 | 1 | `warp-cli connect` (skipped if the registration is expired or missing) |
 | 2 | **quiesce the daemon**, then `registration delete` (skipped when there is nothing to delete) → `registration new` → re-apply saved licence → **restore the snapshotted protocol/mode if re-registration reset them** → `connect` |
 | 3 | `sc stop` / `sc start CloudflareWARP`, re-register if the restart came up unregistered, then reconnect |
+| ½ | **Only with `--clean-tun`:** scan for other VPN/proxy tunnels, write the undo journal, stop the processes, disable their adapters, clear the system proxy — self-restoring if the machine loses connectivity |
 | 3½ | **Only with `--try-protocols`:** switch MASQUE ⇄ WireGuard, try to connect, and put the original back if it doesn't help |
 | ✔ | Verify against `https://www.cloudflare.com/cdn-cgi/trace` that `warp=on` |
 | ⛑ | Whatever happened above, if the device ends up with no registration, get one back before exiting |
@@ -371,10 +433,12 @@ python warp_fix.py --no-pause      # don't wait for Enter at the end (for script
 python warp_fix.py --no-elevate    # already elevated; don't try to re-launch
 python warp_fix.py --try-protocols # also try the other tunnel protocol, and
                                    # put yours back if it doesn't connect
+python warp_fix.py --clean-tun     # stop other VPN/proxy tunnels first
+python warp_fix.py --restore-tun   # undo the above and exit
 ```
 
-`RUN_ME.bat` forwards its own arguments, so `RUN_ME.bat --try-protocols` works
-too and survives the UAC re-launch.
+`RUN_ME.bat` forwards its own arguments, so `RUN_ME.bat --clean-tun` and
+`RUN_ME.bat --restore-tun` work too, and survive the UAC re-launch.
 
 ### Exit codes
 
@@ -385,6 +449,7 @@ too and survives the UAC re-launch.
 | `2` | Not fixed; diagnosis printed. The device is still registered |
 | `3` | WARP says connected but the trace check shows traffic isn't in the tunnel |
 | `4` | Not fixed **and** the device has no registration that could be restored — Cloudflare's API was unreachable. See [Registration Missing](#-help-warp-says-registration-missing) |
+| `5` | Not fixed, but other VPN / proxy software was found in the way — re-runnable with `--clean-tun`. `RUN_ME.bat` reads this code to decide what to offer |
 | `130` | You pressed Ctrl+C |
 
 ### Build a standalone EXE

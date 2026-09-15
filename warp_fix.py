@@ -29,6 +29,9 @@ Usage:
     python warp_fix.py --no-pause      (don't wait for Enter at the end)
     python warp_fix.py --try-protocols (also try the other tunnel protocol,
                                         and put yours back if it doesn't help)
+    python warp_fix.py --clean-tun     (stop other VPN/proxy tunnels that are
+                                        eating WARP's UDP - reversible)
+    python warp_fix.py --restore-tun   (undo the above and exit)
 
 Build a standalone self-elevating EXE (on a machine with Python):
     pip install pyinstaller
@@ -107,6 +110,33 @@ PROXY_PROCESS_HINTS = [
     "forticlient", "anyconnect", "softether",
 ]
 
+# --clean-tun disables adapters and clears proxy settings.  Everything it does
+# is written here first, so --restore-tun can put it all back.
+UNDO_DIR = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "warp_fix")
+UNDO_PATH = os.path.join(UNDO_DIR, "clean_tun_undo.json")
+
+# The subset of TUNNEL_ADAPTER_HINTS that --clean-tun will actually disable.
+# Corporate VPN clients (AnyConnect, FortiClient, EasyConnect, GlobalProtect,
+# Sangfor ...) are deliberately absent: worth reporting, but disabling one can
+# cut somebody off from the network they work on, and that is not a trade this
+# tool gets to make on their behalf.
+CLEANABLE_ADAPTER_HINTS = [
+    "tap-windows", "tap-nordvpn", "tap-proton", "wintun", "clash", "mihomo",
+    "meta tunnel", "netch", "tun2socks", "surge", "radmin", "hamachi",
+    "zerotier", "tailscale", "nordlynx",
+]
+CLEANABLE_PROCESS_HINTS = [
+    "clash", "mihomo", "verge", "v2ray", "xray", "sing-box", "singbox",
+    "netch", "proxifier", "shadowsocks", "trojan", "hysteria", "nekoray",
+    "nekobox", "qv2ray", "surge", "tun2socks",
+]
+
+# -f avoids nesting quotes inside the PowerShell string; the pipes give us a
+# delimiter no adapter name contains.
+PS_ADAPTERS = ("Get-NetAdapter | ForEach-Object { "
+               "'{0}|{1}|{2}' -f $_.Status, $_.Name, $_.InterfaceDescription }")
+INET_PROXY_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+
 # Tunnel protocols warp-cli understands, keyed by lowercase name so that
 # whatever casing the CLI prints maps back onto a value it will accept.
 PROTOCOLS = {"masque": "MASQUE", "wireguard": "WireGuard"}
@@ -133,6 +163,8 @@ MODE_ALIASES = {
 NO_PAUSE = "--no-pause" in sys.argv
 NO_ELEVATE = "--no-elevate" in sys.argv
 TRY_PROTOCOLS = "--try-protocols" in sys.argv
+CLEAN_TUN = "--clean-tun" in sys.argv
+RESTORE_TUN = "--restore-tun" in sys.argv
 
 LOG_PATH = os.path.join(os.environ.get("TEMP", "."), "warp_fix.log")
 _log_fh = None
@@ -530,82 +562,277 @@ def hits(text, hints, skip=("cloudflare", "warp")):
 
 
 def adapter_list():
-    """(text, source) describing this machine's network adapters."""
-    rc, out = ps("Get-NetAdapter | ForEach-Object "
-                 "{ \"$($_.Status)  $($_.Name)  -  $($_.InterfaceDescription)\" }")
+    """([(status, name, description)], source).
+
+    Only rows from Get-NetAdapter carry a name we are willing to act on - the
+    netsh table's column layout is localised, so its names are good enough to
+    show you and not good enough to disable.  An empty list means we could not
+    read the adapters at all, which must never be mistaken for "no adapters"."""
+    rc, out = ps(PS_ADAPTERS)
+    rows = []
     if rc == 0 and out and "$(" not in out:
-        return out, "Get-NetAdapter"
+        for line in out.splitlines():
+            parts = line.split("|")
+            if len(parts) >= 3:
+                rows.append((parts[0].strip(), parts[1].strip(),
+                             "|".join(parts[2:]).strip()))
+    if rows:
+        return rows, "Get-NetAdapter"
+
     rc, out = run(["netsh", "interface", "show", "interface"], timeout=20)
     if rc == 0 and out:
-        return out, "netsh"
-    # Reading the list failed outright.  Report nothing rather than conclude
-    # from an error message that WARP's adapter is missing.
-    return "", "unavailable"
+        for line in out.splitlines():
+            cols = line.split()
+            if len(cols) >= 4 and not line.startswith("-"):
+                rows.append((cols[1], " ".join(cols[3:]), ""))
+        if rows:
+            return rows[1:], "netsh"      # drop the (localised) header row
+    return [], "unavailable"
 
 
 def local_interference_report():
     """Report what on *this* PC could be eating WARP's UDP.
 
-    Read-only throughout: this names things, it never disables or uninstalls
-    anything.  It runs because "the network drops UDP" and "a filter driver on
-    this machine drops UDP" are indistinguishable from the outside - if another
-    device on the same Wi-Fi connects to WARP, everything worth finding is
-    here.  Returns the list of findings so the advice can be ordered by it."""
-    log("Things on this PC that can swallow the tunnel:")
-    findings = []
+    Read-only: this names things, it never disables or uninstalls anything -
+    that is --clean-tun's job, and only when asked.  It runs because "the
+    network drops UDP" and "a filter driver on this machine drops UDP" are
+    indistinguishable from the outside; if another device on the same Wi-Fi
+    connects to WARP, everything worth finding is in here.
 
-    adapters, src = adapter_list()
-    if src == "unavailable":
+    Returns a dict: "findings" for display, plus the structured pieces
+    --clean-tun acts on."""
+    log("Things on this PC that can swallow the tunnel:")
+    report = {"findings": [], "adapters": [], "processes": [],
+              "proxy": False, "actionable": False}
+
+    rows, source = adapter_list()
+    if source == "unavailable":
         log("  (could not read the network adapter list)")
-    for line in hits(adapters, TUNNEL_ADAPTER_HINTS):
-        findings.append("VPN/proxy network adapter: %s" % line)
+    for status, name, desc in rows:
+        blob = ("%s %s" % (name, desc)).lower()
+        if "cloudflare" in blob or "warp" in blob:
+            continue
+        if any(h in blob for h in TUNNEL_ADAPTER_HINTS):
+            report["findings"].append("VPN/proxy network adapter: %s  %s  (%s)"
+                                      % (status, name, desc or "?"))
+            cleanable = (source == "Get-NetAdapter"
+                         and any(h in blob for h in CLEANABLE_ADAPTER_HINTS)
+                         and status.lower() not in ("disabled", "not present"))
+            if cleanable:
+                report["adapters"].append(name)
 
     # WARP's own adapter going missing or being disabled is its own bug, and
     # tells you to reinstall rather than to go hunting through the network.
-    if adapters and not re.search(r"cloudflare|warp", adapters, re.I):
-        findings.append("WARP's own network adapter is not in the adapter list "
-                        "- the client's driver did not install or was removed")
-    else:
-        for line in (adapters or "").splitlines():
-            if re.search(r"cloudflare|warp", line, re.I) and \
-                    re.search(r"\b(Disabled|Not Present)\b", line, re.I):
-                findings.append("WARP's own adapter is not up: %s" % line.strip())
+    warp_rows = [r for r in rows if re.search(r"cloudflare|warp", "%s %s" % (r[1], r[2]), re.I)]
+    if rows and not warp_rows:
+        report["findings"].append(
+            "WARP's own network adapter is not in the adapter list - the "
+            "client's driver did not install or was removed")
+    for status, name, desc in warp_rows:
+        if status.lower() in ("disabled", "not present"):
+            report["findings"].append("WARP's own adapter is %s: %s" % (status, name))
 
     rc, tasks = run(["tasklist", "/fo", "csv", "/nh"], timeout=40)
     seen = set()
     for line in hits(tasks, PROXY_PROCESS_HINTS):
         name = line.split(",")[0].strip('"')
-        if name.lower() not in seen:
-            seen.add(name.lower())
-            findings.append("VPN/proxy process running: %s" % name)
+        if name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        report["findings"].append("VPN/proxy process running: %s" % name)
+        if any(h in name.lower() for h in CLEANABLE_PROCESS_HINTS):
+            report["processes"].append(name)
 
     rc, out = run(["netsh", "winhttp", "show", "proxy"], timeout=20)
     if rc == 0 and out and "Direct access" not in out and "DIRECT" not in out.upper():
-        findings.append("System-wide (WinHTTP) proxy is set: %s"
-                        % " ".join(out.split())[:120])
+        report["findings"].append("System-wide (WinHTTP) proxy is set: %s"
+                                  % " ".join(out.split())[:120])
+        report["proxy"] = True
 
-    rc, out = run(["reg", "query",
-                   r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-                   "/v", "ProxyServer"], timeout=20)
+    rc, out = run(["reg", "query", INET_PROXY_KEY, "/v", "ProxyServer"], timeout=20)
     if rc == 0 and out:
         m = re.search(r"ProxyServer\s+REG_SZ\s+(\S+)", out)
         if m:
-            findings.append("Windows proxy setting points at %s" % m.group(1))
+            report["findings"].append("Windows proxy setting points at %s" % m.group(1))
+            report["proxy"] = True
 
     rc, out = run(["netsh", "advfirewall", "show", "allprofiles"], timeout=20)
     if rc == 0 and re.search(r"Outbound connections.*Block", out or "", re.I):
-        findings.append("Windows Firewall is set to BLOCK outbound connections "
-                        "by default - WARP needs an outbound UDP allow rule")
+        report["findings"].append(
+            "Windows Firewall is set to BLOCK outbound connections by default "
+            "- WARP needs an outbound UDP allow rule")
 
-    if findings:
-        for f in findings:
+    report["actionable"] = bool(report["adapters"] or report["processes"]
+                                or report["proxy"])
+    if report["findings"]:
+        for f in report["findings"]:
             log("  !! " + f)
-    elif src == "unavailable":
+    elif source == "unavailable":
         log("  (nothing obvious in what could be read)")
     else:
         log("  (nothing obvious - no VPN/proxy adapters, no proxy processes,")
         log("   no system proxy, firewall not blocking outbound by default)")
-    return findings
+    return report
+
+
+def undo_write(data):
+    """Record what we are about to change, before we change it."""
+    try:
+        os.makedirs(UNDO_DIR, exist_ok=True)
+        with open(UNDO_PATH, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        return True
+    except OSError as e:
+        log("!! Could not write the undo file (%s) - not going to change" % e)
+        log("   anything I cannot put back.")
+        return False
+
+
+def undo_read():
+    try:
+        with open(UNDO_PATH, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def set_adapter(name, enabled):
+    """Enable/disable one adapter by name. Returns (ok, message)."""
+    rc, out = ps("%s-NetAdapter -Name '%s' -Confirm:$false"
+                 % ("Enable" if enabled else "Disable", name.replace("'", "''")))
+    if rc == 0:
+        return True, ""
+    rc2, out2 = run(["netsh", "interface", "set", "interface",
+                     "name=%s" % name,
+                     "admin=%s" % ("enable" if enabled else "disable")], timeout=30)
+    return rc2 == 0, (out2 or out or "failed")
+
+
+def internet_ok():
+    """Is there still a way off this machine?"""
+    return tcp_ok("1.1.1.1") or tcp_ok(API_HOST)
+
+
+def restore_tun(announce=True):
+    """Undo everything the last --clean-tun did."""
+    undo = undo_read()
+    if not undo:
+        if announce:
+            log("Nothing to restore - no undo file at %s" % UNDO_PATH)
+        return False
+    step("Restoring what --clean-tun changed")
+    log("Undo file written %s" % undo.get("when", "(unknown)"))
+
+    for name in undo.get("adapters", []):
+        ok, out = set_adapter(name, True)
+        log("  re-enable adapter %-22s : %s" % (name, "OK" if ok else out))
+
+    if undo.get("winhttp"):
+        rc, out = run(["netsh", "winhttp", "set", "proxy", undo["winhttp"]], timeout=20)
+        log("  WinHTTP proxy back to %-18s : %s"
+            % (undo["winhttp"], "OK" if rc == 0 else (out or "failed")))
+    if undo.get("inet_proxy"):
+        rc, _ = run(["reg", "add", INET_PROXY_KEY, "/v", "ProxyServer",
+                     "/t", "REG_SZ", "/d", undo["inet_proxy"], "/f"], timeout=20)
+        log("  Windows proxy back to %-18s : %s"
+            % (undo["inet_proxy"], "OK" if rc == 0 else "failed"))
+    raw = undo.get("inet_enable")
+    if raw:
+        try:
+            num = int(raw, 16) if str(raw).lower().startswith("0x") else int(raw)
+        except ValueError:
+            num = None
+        if num is not None:
+            run(["reg", "add", INET_PROXY_KEY, "/v", "ProxyEnable",
+                 "/t", "REG_DWORD", "/d", str(num), "/f"], timeout=20)
+
+    log("Restored. Processes that were stopped are not restarted - launch them")
+    log("again yourself if you want them back.")
+    try:
+        os.remove(UNDO_PATH)
+    except OSError:
+        pass
+    return True
+
+
+def clean_tun(report):
+    """Clear other VPN/proxy tunnels out of WARP's way. Only with --clean-tun.
+
+    Reversible by design.  Every adapter this disables and every proxy setting
+    it clears is written to UNDO_PATH *before* the change, so --restore-tun can
+    put it all back even if this run dies half way.  And if the machine loses
+    its internet connection as a result, everything goes back immediately
+    without waiting to be asked: a tool that takes you offline while repairing
+    your VPN has not helped anybody.
+
+    What it cannot promise is a *complete* clean.  These tools install a WFP
+    filter driver that only goes away when the application itself is
+    uninstalled; disabling the adapter stops it carrying traffic, which is what
+    WARP needs, but the driver stays on disk until you remove the app."""
+    step("Clearing other VPN / proxy tunnels out of the way (--clean-tun)")
+    if not report.get("actionable"):
+        log("Nothing to clean here - no other TUN/TAP adapter, no proxy process")
+        log("and no system proxy was found.")
+        return False
+
+    undo = {"when": dt.datetime.now().isoformat(timespec="seconds"),
+            "adapters": list(report["adapters"]), "winhttp": None,
+            "inet_proxy": None, "inet_enable": None}
+
+    rc, out = run(["netsh", "winhttp", "show", "proxy"], timeout=20)
+    m = re.search(r"Proxy Server\(s\)\s*:\s*(\S+)", out or "")
+    if m:
+        undo["winhttp"] = m.group(1)
+    rc, out = run(["reg", "query", INET_PROXY_KEY, "/v", "ProxyServer"], timeout=20)
+    m = re.search(r"ProxyServer\s+REG_SZ\s+(\S+)", out or "")
+    if m:
+        undo["inet_proxy"] = m.group(1)
+    rc, out = run(["reg", "query", INET_PROXY_KEY, "/v", "ProxyEnable"], timeout=20)
+    m = re.search(r"ProxyEnable\s+REG_DWORD\s+(\S+)", out or "")
+    if m:
+        undo["inet_enable"] = m.group(1)
+
+    if not undo_write(undo):
+        return False
+
+    for name in report["processes"]:
+        rc, out = run(["taskkill", "/IM", name, "/T"], timeout=30)
+        if rc != 0:
+            rc, out = run(["taskkill", "/IM", name, "/T", "/F"], timeout=30)
+        log("  stop process %-27s : %s" % (name, "OK" if rc == 0 else "not running"))
+
+    disabled = []
+    for name in report["adapters"]:
+        ok, out = set_adapter(name, False)
+        log("  disable adapter %-24s : %s" % (name, "OK" if ok else out))
+        if ok:
+            disabled.append(name)
+    undo["adapters"] = disabled
+    undo_write(undo)
+
+    if report.get("proxy"):
+        rc, out = run(["netsh", "winhttp", "reset", "proxy"], timeout=20)
+        log("  clear WinHTTP proxy %-20s : %s" % ("", "OK" if rc == 0 else "failed"))
+        rc, out = run(["reg", "add", INET_PROXY_KEY, "/v", "ProxyEnable",
+                       "/t", "REG_DWORD", "/d", "0", "/f"], timeout=20)
+        log("  turn off Windows proxy %-17s : %s" % ("", "OK" if rc == 0 else "failed"))
+
+    run(["ipconfig", "/flushdns"], timeout=20)
+    time.sleep(3)
+
+    if not internet_ok():
+        log()
+        log("!! That took this machine off the internet - putting it all back.")
+        restore_tun(announce=False)
+        return False
+
+    log()
+    log("Cleared. Undo written to %s" % UNDO_PATH)
+    log("Put everything back at any time with:  warp_fix.py --restore-tun")
+    log("This disabled the adapters; it did not uninstall the filter drivers")
+    log("those tools install. For a complete clean, uninstall the app and")
+    log("reboot - a driver stays loaded until then.")
+    return True
 
 
 def udp_diagnosis():
@@ -684,13 +911,19 @@ def network_diagnosis(warp):
     # A named suspect on this machine outranks any guess about the network -
     # especially when UDP is dead, because a TUN proxy produces exactly the
     # same symptom as a hostile network and is far easier to check.
-    if local:
+    if local["findings"]:
         log("  * START HERE: the checks above found %d thing(s) on this PC that"
-            % len(local))
+            % len(local["findings"]))
         log("    can break the tunnel. Quit them properly - a TUN-mode proxy")
         log("    keeps filtering after its window is closed, so exit it from")
         log("    the tray, or uninstall it - then REBOOT and try again.")
         log("    Closing the app is not enough; the filter driver has to go.")
+    if local["actionable"] and not CLEAN_TUN:
+        log("  * Or let this tool do it: re-run with --clean-tun. It stops the")
+        log("    proxy processes, disables their tunnel adapters and clears the")
+        log("    system proxy, writing an undo file first - --restore-tun puts")
+        log("    every bit of it back, and it self-restores immediately if the")
+        log("    machine loses its connection.")
 
     if verdict == "udp-blocked":
         log("  * UDP is not getting through at all. If another device on this")
@@ -725,6 +958,7 @@ def network_diagnosis(warp):
         log("    team login and cannot be used without one.")
     log("  * Reinstall WARP from https://1.1.1.1/ and run this script again.")
     log("  * Full log: %s" % LOG_PATH)
+    return local
 
 
 # --------------------------------------------------------------------------- #
@@ -907,6 +1141,12 @@ def main():
     step("Cloudflare WARP fix  -  stuck on 'Connecting' / 26%")
     log("Log file: %s" % LOG_PATH)
 
+    # Undoing a cleanup must work even on a machine where WARP has since been
+    # uninstalled - it is the user's adapters and proxy settings we are putting
+    # back, and none of that depends on warp-cli being here.
+    if RESTORE_TUN:
+        return 0 if restore_tun() else 1
+
     cli = find_cli()
     if not cli:
         log("!! warp-cli.exe not found. Install Cloudflare WARP from https://1.1.1.1/")
@@ -916,6 +1156,10 @@ def main():
 
     if not ensure_service_running():
         return 1
+
+    if CLEAN_TUN:
+        step("Checking for other VPN / proxy tunnels")
+        clean_tun(local_interference_report())
 
     vu, expired = conf_validity()
     if vu:
@@ -959,12 +1203,17 @@ def main():
             ensure_registration(warp)
 
     if not connected:
-        network_diagnosis(warp)
+        local = network_diagnosis(warp)
         log()
         if warp.registration_present() is False:
             log("RESULT: NOT FIXED - and this device has no WARP registration.")
             log("        See the 'Repair' section above before anything else.")
             return 4
+        if local["actionable"] and not CLEAN_TUN:
+            log("RESULT: NOT FIXED - but other VPN / proxy software is in the")
+            log("        way. Re-run with --clean-tun to clear it; everything")
+            log("        it changes is undone by --restore-tun.")
+            return 5
         log("RESULT: NOT FIXED")
         return 2
 

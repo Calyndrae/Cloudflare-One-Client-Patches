@@ -121,13 +121,35 @@ set "EXTRA="
 "%PYCMD%" %PYARGS% "%SCRIPT%" --no-elevate --no-pause %EXTRA% %SELFARGS%
 set "RC=%errorlevel%"
 
-rem  Exit code 2 means "not fixed, but the machine is in one piece". The last
-rem  thing left to try is the other tunnel protocol, and that is the user's
-rem  call to make - so ask, rather than changing it behind their back. The
-rem  script puts their protocol back if the other one does not connect either.
-if not "%RC%"=="2" goto :done
-if defined EXTRA goto :done
-echo %SELFARGS% | find /i "--try-protocols" >nul
+rem  The script tells us what is worth offering next:
+rem    5 = other VPN / proxy software is in the way and can be cleared
+rem    2 = not fixed, machine in one piece, the protocol is the last idea
+rem  Both change things on this PC, so both are asked rather than assumed.
+if "%RC%"=="5" goto :offer_clean
+if "%RC%"=="2" goto :offer_protocol
+goto :done
+
+:offer_clean
+echo %EXTRA% %SELFARGS% | find /i "--clean-tun" >nul
+if not errorlevel 1 goto :offer_protocol
+echo.
+echo   Other VPN / proxy software is standing in WARP's way - the
+echo   details are listed above. This can stop those programs, switch
+echo   off their tunnel adapters and clear the system proxy.
+echo.
+echo   It is reversible: everything is written down first, and
+echo   RUN_ME.bat --restore-tun puts all of it back. If the cleanup
+echo   takes this PC off the internet, it undoes itself immediately.
+echo.
+set "ANSWER="
+set /p "ANSWER=  Clear them out of the way now? [y/N] "
+if /i not "%ANSWER%"=="y" goto :offer_protocol
+set "EXTRA=%EXTRA% --clean-tun"
+echo.
+goto :run_fix
+
+:offer_protocol
+echo %EXTRA% %SELFARGS% | find /i "--try-protocols" >nul
 if not errorlevel 1 goto :done
 echo.
 echo   One thing is left to try: WARP can tunnel over MASQUE or over
@@ -138,7 +160,7 @@ echo.
 set "ANSWER="
 set /p "ANSWER=  Try the other tunnel protocol now? [y/N] "
 if /i not "%ANSWER%"=="y" goto :done
-set "EXTRA=--try-protocols"
+set "EXTRA=%EXTRA% --try-protocols"
 echo.
 goto :run_fix
 
