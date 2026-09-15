@@ -6,8 +6,12 @@ Root cause this targets: the device registration / tunnel config in
 C:\ProgramData\Cloudflare\conf.json has expired ("valid_until" in the past)
 and the WARP service fails to renew it, so every connect attempt cycles
 through the fallback ports and never completes.  Re-registering the device
-fixes it.  The script also has fallbacks (service restart, protocol switch)
-and a final network diagnosis if nothing works.
+fixes it.  The script also has a service-restart fallback and a final
+network diagnosis if nothing works.
+
+Your settings are left alone.  The tunnel protocol (MASQUE / WireGuard) and
+the WARP mode are read before the device is re-registered and put back
+afterwards if re-registration reset them.  Nothing else is changed.
 
 Usage:
     python warp_fix.py            (auto-prompts for admin via UAC)
@@ -42,6 +46,30 @@ WARP_EDGE_IP = "162.159.198.2"
 API_HOST = "api.cloudflareclient.com"
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 CONNECT_WAIT = 30          # seconds to wait for "Connected" after each attempt
+
+# Tunnel protocols warp-cli understands, keyed by lowercase name so that
+# whatever casing the CLI prints maps back onto a value it will accept.
+PROTOCOLS = {"masque": "MASQUE", "wireguard": "WireGuard"}
+
+# `warp-cli settings` reports the mode in CamelCase, but `warp-cli mode` only
+# accepts the short form.  Anything not in here is left alone rather than
+# guessed at - we never want to silently change the user's mode.
+MODE_ALIASES = {
+    "warp": "warp",
+    "warponly": "warp",
+    "warpwithdnsoverhttps": "warp+doh",
+    "warp+doh": "warp+doh",
+    "warpwithdnsovertls": "warp+dot",
+    "warp+dot": "warp+dot",
+    "dnsoverhttps": "doh",
+    "doh": "doh",
+    "dnsovertls": "dot",
+    "dot": "dot",
+    "proxyonly": "proxy",
+    "proxy": "proxy",
+    "tunnelonly": "tunnel_only",
+    "tunnel_only": "tunnel_only",
+}
 NO_PAUSE = "--no-pause" in sys.argv
 NO_ELEVATE = "--no-elevate" in sys.argv
 
@@ -163,6 +191,71 @@ class Warp:
             info["license"] = m.group(1)
         return info
 
+    # --- settings we must not change -------------------------------------- #
+    def settings_text(self):
+        _, out = self.cmd("settings", timeout=20)
+        return out
+
+    def tunnel_protocol(self):
+        """Current tunnel protocol, or None if we cannot read it with
+        confidence.  Only the names warp-cli accepts are ever returned, so we
+        can never hand a garbage value back to `tunnel protocol set`."""
+        rc, out = self.cmd("tunnel", "protocol", "get", timeout=20)
+        if rc == 0:
+            m = re.search(r"\b(MASQUE|WireGuard)\b", out, re.I)
+            if m:
+                return PROTOCOLS[m.group(1).lower()]
+        m = re.search(r"protocol\s*[:=]\s*(MASQUE|WireGuard)\b",
+                      self.settings_text(), re.I)
+        if m:
+            return PROTOCOLS[m.group(1).lower()]
+        return None
+
+    def set_tunnel_protocol(self, proto):
+        canonical = PROTOCOLS.get(proto.lower())
+        if not canonical:
+            return False, "unrecognised protocol %r - left as-is" % proto
+        rc, out = self.cmd("tunnel", "protocol", "set", canonical, timeout=30)
+        return rc == 0, out
+
+    def mode(self):
+        """Current WARP mode as warp-cli spells it, or None if unknown."""
+        m = re.search(r"^\s*Mode\s*[:=]\s*(\S+)", self.settings_text(), re.M)
+        return m.group(1).strip(".,") if m else None
+
+    def set_mode(self, mode):
+        short = MODE_ALIASES.get(mode.lower().replace(" ", ""))
+        if not short:
+            return False, "unrecognised mode %r - left as-is" % mode
+        rc, out = self.cmd("mode", short, timeout=30)
+        return rc == 0, out
+
+    def snapshot_settings(self):
+        """Read back the settings re-registration is known to reset."""
+        snap = {"protocol": self.tunnel_protocol(), "mode": self.mode()}
+        log("Current tunnel protocol: %s" % (snap["protocol"] or "(unknown)"))
+        log("Current WARP mode      : %s" % (snap["mode"] or "(unknown)"))
+        return snap
+
+    def restore_settings(self, snap):
+        """Put protocol/mode back if re-registering changed them. Never
+        switches the user onto a protocol or mode they did not pick."""
+        want = snap.get("protocol")
+        if want:
+            now = self.tunnel_protocol()
+            if now and now.lower() != want.lower():
+                ok, out = self.set_tunnel_protocol(want)
+                log("Restoring tunnel protocol %s -> %s : %s"
+                    % (now, want, "OK" if ok else (out or "failed")))
+
+        want = snap.get("mode")
+        if want:
+            now = self.mode()
+            if now and now.lower() != want.lower():
+                ok, out = self.set_mode(want)
+                log("Restoring WARP mode %s -> %s : %s"
+                    % (now, want, "OK" if ok else (out or "failed")))
+
 
 # --------------------------------------------------------------------------- #
 # service management
@@ -264,12 +357,23 @@ def network_diagnosis(warp):
     for l in warp.status().splitlines():
         log("  " + l)
     log()
+    proto = warp.tunnel_protocol()
+    mode = warp.mode()
+    log("Tunnel protocol: %s   |   Mode: %s"
+        % (proto or "(unknown)", mode or "(unknown)"))
+    log()
     log("Things to try next:")
     log("  * Connect to a different network (e.g. phone hotspot). If WARP works")
     log("    there, this network is blocking UDP/VPN traffic and no client-side")
     log("    fix will help.")
     log("  * Uninstall other VPN / proxy tools (Clash, v2ray, Radmin VPN, ...)")
     log("    and reboot - their filter drivers can block the WARP tunnel.")
+    if proto:
+        other = "WireGuard" if proto.lower() == "masque" else "MASQUE"
+        log("  * Some networks pass one tunnel protocol and block the other. You")
+        log("    are on %s; switching to %s in the WARP app (Settings >" % (proto, other))
+        log("    Advanced > Connection options) may get you through. This tool")
+        log("    deliberately does not change that setting for you.")
     log("  * Reinstall WARP from https://1.1.1.1/ and run this script again.")
     log("  * Full log: %s" % LOG_PATH)
 
@@ -278,13 +382,13 @@ def network_diagnosis(warp):
 # fix attempts
 # --------------------------------------------------------------------------- #
 def attempt_plain_connect(warp):
-    step("Step 1/4: plain connect")
+    step("Step 1/3: plain connect")
     warp.cmd("connect")
     return warp.wait_connected(20)
 
 
-def attempt_reregister(warp):
-    step("Step 2/4: re-register device (fixes expired registration)")
+def attempt_reregister(warp, snap):
+    step("Step 2/3: re-register device (fixes expired registration)")
     info = warp.registration_info()
     acct = info["account_type"] or "unknown"
     lic = info["license"]
@@ -307,33 +411,21 @@ def attempt_reregister(warp):
     if lic:
         rc, out = warp.cmd("registration", "license", lic, timeout=60)
         log("re-apply license    -> %s" % (out or rc))
-    warp.cmd("tunnel", "protocol", "reset")
-    warp.cmd("mode", "warp")
+    # A fresh registration can come back on WARP's defaults - put the user's
+    # own tunnel protocol and mode back rather than leaving ours in place.
+    warp.restore_settings(snap)
     time.sleep(2)
     warp.cmd("connect")
     return warp.wait_connected()
 
 
 def attempt_service_restart(warp):
-    step("Step 3/4: restart the WARP service and reconnect")
+    step("Step 3/3: restart the WARP service and reconnect")
     if not restart_service():
         log("!! Service did not come back up.")
         return False
     warp.cmd("connect")
     return warp.wait_connected()
-
-
-def attempt_protocol_switch(warp):
-    step("Step 4/4: try WireGuard protocol instead of MASQUE")
-    warp.cmd("disconnect")
-    warp.cmd("tunnel", "protocol", "set", "WireGuard")
-    time.sleep(2)
-    warp.cmd("connect")
-    if warp.wait_connected():
-        log("Connected with WireGuard - leaving that setting in place.")
-        return True
-    warp.cmd("tunnel", "protocol", "reset")
-    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -394,21 +486,24 @@ def main():
     st = warp.status()
     log("Current status: %s" % (st.splitlines()[0] if st else "(no output)"))
 
+    # Read the settings we must hand back unchanged before touching anything.
+    snap = warp.snapshot_settings()
+
     connected = warp.is_connected(st)
     if connected:
         log("Already connected - will just verify below.")
     else:
         # If the registration is expired or missing, skip straight to re-register.
         if expired is not False:
-            connected = attempt_reregister(warp)
+            connected = attempt_reregister(warp, snap)
         else:
             connected = attempt_plain_connect(warp)
             if not connected:
-                connected = attempt_reregister(warp)
+                connected = attempt_reregister(warp, snap)
         if not connected:
             connected = attempt_service_restart(warp)
         if not connected:
-            connected = attempt_protocol_switch(warp)
+            warp.restore_settings(snap)
 
     if not connected:
         network_diagnosis(warp)

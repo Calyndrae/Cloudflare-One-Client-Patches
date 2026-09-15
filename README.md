@@ -1,6 +1,9 @@
 # Cloudflare One Client Patches
 
-Little fix-it tools for the **Cloudflare WARP** app (the 1.1.1.1 app) on Windows.
+**Repair tools for the Cloudflare WARP / Cloudflare One client on Windows.**
+They fix the client without touching your settings — your tunnel protocol
+(MASQUE or WireGuard), your mode and your WARP+ / Zero Trust subscription are
+all left exactly as you had them.
 
 Right now there is one tool:
 
@@ -34,50 +37,51 @@ itself. But sometimes it forgets, the pass runs out, and the bus driver says
 "Connecting…".
 
 **The fix:** throw the old pass away and ask for a brand new one. That's the
-main thing this tool does. If that doesn't work, it tries a few other tricks
-too.
+main thing this tool does. If that doesn't work, it restarts WARP's background
+service and tries again.
 
 ---
 
-## 🚀 How to use it — the easy way
+## 🚀 How to use it
 
-You need **Windows**. That's it.
+You need **Windows**. That's it — you do **not** need to install Python
+first, the tool does that for you.
 
-### Step 1 — Get Python
+### Step 1 — Download **one file: `RUN_ME.bat`**
 
-Python is the thing that runs the tool. Ask a grown-up if you're not sure.
+👉 **[Click here to download `RUN_ME.bat`](https://raw.githubusercontent.com/Calyndrae/Cloudflare-One-Client-Patches/HEAD/RUN_ME.bat)** 👈
 
-1. Go to **https://www.python.org/downloads/**
-2. Click the big yellow **Download Python** button.
-3. Open the file you just downloaded.
-4. ⚠️ **Very important:** tick the little box that says
-   **"Add python.exe to PATH"** at the bottom of the window *before* you click
-   Install. If you miss it, the tool won't be able to find Python.
-5. Click **Install Now** and wait.
+That link is the **only** file you need.
 
-*Already have Python? Skip this step.*
+- If your browser starts the download straight away — great, it's in your
+  **Downloads** folder.
+- If your browser shows the text of the file instead of downloading it,
+  press <kbd>Ctrl</kbd> + <kbd>S</kbd> to save it. Make sure the name stays
+  **`RUN_ME.bat`** and *not* `RUN_ME.bat.txt`.
+- Edge or Chrome may warn that the file "isn't commonly downloaded". Choose
+  **Keep** → **Keep anyway**. (It's a small text file; you can open it in
+  Notepad and read every line.)
 
-### Step 2 — Get the files
+> Prefer to grab everything? Click the green **Code** button at the top of this
+> page → **Download ZIP** → right-click the ZIP → **Extract All…**. The file to
+> run is still **`RUN_ME.bat`**.
 
-1. At the top of this page, click the green **Code** button.
-2. Click **Download ZIP**.
-3. Find the ZIP in your **Downloads** folder, right-click it, choose
-   **Extract All…**, then click **Extract**.
+### Step 2 — Double-click `RUN_ME.bat`
 
-### Step 3 — Run it
-
-1. Open the folder you just unzipped.
-2. Double-click **`RUN_ME.bat`**.
-3. Windows will pop up a blue-ish box asking
+1. Windows pops up a blue-ish box asking
    **"Do you want to allow this app to make changes to your device?"**
    Click **Yes**. 👍
-   (It has to ask, because fixing WARP means changing computer settings.)
-4. A black window opens and starts typing things. **Just let it work.**
-   It usually takes less than a minute.
+   (It has to ask, because fixing WARP means restarting a Windows service.)
+2. A black window opens and starts typing things. **Just let it work.**
 
-### Step 4 — Read the last line
+If Python isn't on your computer, the window will say *"Python is not
+installed. Installing it now"* and do it for you. That part needs internet and
+takes a couple of minutes. After that it runs the fix, which usually takes
+less than a minute.
 
-When it's done, look at the very bottom of the black window:
+### Step 3 — Read the last line
+
+When it's done, look near the bottom of the black window:
 
 - ✅ **`RESULT: FIXED`** — yay! WARP works now. Open the app and check that it
   says **Connected**.
@@ -102,10 +106,16 @@ Try these, in this order:
    (school Wi-Fi, some home routers) is blocking WARP, and nothing on your
    computer can fix that.
 
-3. **Reinstall WARP.** Uninstall the 1.1.1.1 / WARP app, download it again from
+3. **Try the other tunnel protocol — your choice, not ours.** Some networks
+   allow one and block the other. In the WARP app go to **Settings →
+   Advanced → Connection options** and switch between **MASQUE** and
+   **WireGuard**. The tool tells you which one you're on but never changes it
+   for you.
+
+4. **Reinstall WARP.** Uninstall the 1.1.1.1 / WARP app, download it again from
    **https://1.1.1.1/**, install it, then run the tool again.
 
-4. **Show someone the log.** The tool writes down everything it did in a file.
+5. **Show someone the log.** The tool writes down everything it did in a file.
    Press <kbd>Windows</kbd> + <kbd>R</kbd>, type `%TEMP%\warp_fix.log`, press
    Enter. That file is very handy if you ask someone for help.
 
@@ -117,7 +127,18 @@ Try these, in this order:
 It only touches Cloudflare WARP — it restarts WARP's background service and
 asks Cloudflare for a new registration. It doesn't touch your files, your
 games, or anything else. All of the code is right here in
-[`warp_fix.py`](warp_fix.py) so anyone can read it.
+[`warp_fix.py`](warp_fix.py) and [`RUN_ME.bat`](RUN_ME.bat) so anyone can read
+it.
+
+**Will it change my WARP settings?**
+No. It reads your tunnel protocol (MASQUE / WireGuard) and your mode before it
+starts, and if re-registering resets them it puts your own values straight
+back. It will never move you from MASQUE to WireGuard, or the other way round.
+
+**What does it install?**
+Python, and only if you don't already have it. It's fetched with
+[winget](https://learn.microsoft.com/windows/package-manager/) if your Windows
+has it, otherwise straight from **python.org**. Nothing else is installed.
 
 **Why does it ask for administrator permission?**
 Because WARP runs as a Windows *service*, and only an administrator is allowed
@@ -141,6 +162,14 @@ Sorry — this one is Windows-only. It will tell you so and stop.
 <details>
 <summary>Click here for the technical details</summary>
 
+### Files
+
+| File | Purpose |
+|---|---|
+| `RUN_ME.bat` | The download target. Self-elevates via UAC, bootstraps Python (winget, then the python.org installer), fetches `warp_fix.py` if it isn't alongside, then runs it with `--no-elevate --no-pause`. |
+| `warp_fix.py` | The fix itself. Runs standalone under any Python 3.8+ on Windows. |
+| `build_exe.bat` | Optional. Installs Python + PyInstaller if needed and builds `dist\WarpFix.exe`. |
+
 ### What it actually does
 
 The usual root cause is that the device registration in
@@ -153,16 +182,22 @@ The script runs this ladder and stops at the first thing that works:
 
 | Step | Action |
 |---|---|
-| 0 | Self-elevate via UAC, locate `warp-cli.exe`, make sure the `CloudflareWARP` service is running, read `valid_until` from `conf.json` |
+| 0 | Self-elevate via UAC, locate `warp-cli.exe`, make sure the `CloudflareWARP` service is running, read `valid_until` from `conf.json`, **snapshot the current tunnel protocol and mode** |
 | 1 | `warp-cli connect` (skipped if the registration is already expired) |
-| 2 | `registration delete` → `registration new` → re-apply saved licence → `tunnel protocol reset` → `mode warp` → `connect` |
+| 2 | `registration delete` → `registration new` → re-apply saved licence → **restore the snapshotted protocol/mode if re-registration reset them** → `connect` |
 | 3 | `sc stop` / `sc start CloudflareWARP`, then reconnect |
-| 4 | `tunnel protocol set WireGuard` instead of MASQUE, then reconnect |
 | ✔ | Verify against `https://www.cloudflare.com/cdn-cgi/trace` that `warp=on` |
 
+**Settings are never changed on your behalf.** There is no
+`tunnel protocol set`, no `tunnel protocol reset` and no `mode warp` in the
+happy path — the only time the script writes a protocol or mode is to put back
+the value it read from your machine before it started. Mode strings it doesn't
+recognise are left untouched rather than guessed at.
+
 If nothing connects, it runs a network diagnosis: TCP/443 reachability to the
-WARP edge (`162.159.198.2`), `api.cloudflareclient.com` and `1.1.1.1`, plus the
-final `warp-cli status` output.
+WARP edge (`162.159.198.2`), `api.cloudflareclient.com` and `1.1.1.1`, the
+current protocol/mode, and the final `warp-cli status` output. Switching
+protocol is offered there as advice for you to act on, not as an action.
 
 ### Command line
 
@@ -184,7 +219,8 @@ python warp_fix.py --no-elevate # already elevated; don't try to re-launch
 
 ### Build a standalone EXE
 
-On a machine with Python, double-click **`build_exe.bat`**, or run:
+Double-click **`build_exe.bat`** — it installs Python and PyInstaller if they
+are missing. Or by hand:
 
 ```powershell
 pip install pyinstaller
