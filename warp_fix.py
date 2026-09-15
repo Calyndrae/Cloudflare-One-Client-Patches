@@ -82,6 +82,31 @@ UDP_PROBES = [
     (WARP_EDGE_IP, 4500, "quic", "WARP edge, fallback"),
 ]
 
+# Names that turn up in the adapter list when a TUN/TAP-based VPN or proxy is
+# installed.  These matter because WARP's tunnel is UDP: a TUN proxy that grabs
+# the default route will happily carry TCP (so every TCP check below passes)
+# and drop the UDP it cannot forward, which looks exactly like a hostile
+# network from the outside.  Matching is on substrings, and "cloudflare" is
+# skipped so WARP's own adapter never reports itself.
+TUNNEL_ADAPTER_HINTS = [
+    "tap-windows", "tap-nordvpn", "tap-proton", "openvpn", "wintun",
+    "wireguard", "nordlynx", "clash", "mihomo", "meta tunnel", "netch",
+    "tun2socks", "surge", "radmin", "hamachi", "zerotier", "tailscale",
+    "expressvpn", "surfshark", "astrill", "softether", "anyconnect",
+    "forticlient", "pangp", "easyconnect", "sangfor", "juniper",
+]
+
+# Processes worth naming if they are running.  Same reasoning: several of these
+# install a WFP filter driver that keeps working after you close the window.
+PROXY_PROCESS_HINTS = [
+    "clash", "mihomo", "verge", "v2ray", "xray", "sing-box", "singbox",
+    "netch", "proxifier", "shadowsocks", "trojan", "hysteria", "nekoray",
+    "nekobox", "qv2ray", "surge", "tun2socks", "openvpn", "radmin",
+    "hamachi", "zerotier", "tailscale", "nordvpn", "expressvpn",
+    "surfshark", "protonvpn", "astrill", "easyconnect", "sangfor",
+    "forticlient", "anyconnect", "softether",
+]
+
 # Tunnel protocols warp-cli understands, keyed by lowercase name so that
 # whatever casing the CLI prints maps back onto a value it will accept.
 PROTOCOLS = {"masque": "MASQUE", "wireguard": "WireGuard"}
@@ -486,6 +511,103 @@ def udp_probe(host, port, kind, timeout=4):
             sock.close()
 
 
+def ps(script, timeout=40):
+    """Run a PowerShell one-liner. Returns (rc, output)."""
+    return run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-Command", script], timeout=timeout)
+
+
+def hits(text, hints, skip=("cloudflare", "warp")):
+    """Lines of `text` containing any of `hints`, minus the ones we expect."""
+    found = []
+    for line in (text or "").splitlines():
+        low = line.lower()
+        if not low.strip() or any(s in low for s in skip):
+            continue
+        if any(h in low for h in hints):
+            found.append(line.strip())
+    return found
+
+
+def adapter_list():
+    """(text, source) describing this machine's network adapters."""
+    rc, out = ps("Get-NetAdapter | ForEach-Object "
+                 "{ \"$($_.Status)  $($_.Name)  -  $($_.InterfaceDescription)\" }")
+    if rc == 0 and out and "$(" not in out:
+        return out, "Get-NetAdapter"
+    rc, out = run(["netsh", "interface", "show", "interface"], timeout=20)
+    if rc == 0 and out:
+        return out, "netsh"
+    # Reading the list failed outright.  Report nothing rather than conclude
+    # from an error message that WARP's adapter is missing.
+    return "", "unavailable"
+
+
+def local_interference_report():
+    """Report what on *this* PC could be eating WARP's UDP.
+
+    Read-only throughout: this names things, it never disables or uninstalls
+    anything.  It runs because "the network drops UDP" and "a filter driver on
+    this machine drops UDP" are indistinguishable from the outside - if another
+    device on the same Wi-Fi connects to WARP, everything worth finding is
+    here.  Returns the list of findings so the advice can be ordered by it."""
+    log("Things on this PC that can swallow the tunnel:")
+    findings = []
+
+    adapters, src = adapter_list()
+    if src == "unavailable":
+        log("  (could not read the network adapter list)")
+    for line in hits(adapters, TUNNEL_ADAPTER_HINTS):
+        findings.append("VPN/proxy network adapter: %s" % line)
+
+    # WARP's own adapter going missing or being disabled is its own bug, and
+    # tells you to reinstall rather than to go hunting through the network.
+    if adapters and not re.search(r"cloudflare|warp", adapters, re.I):
+        findings.append("WARP's own network adapter is not in the adapter list "
+                        "- the client's driver did not install or was removed")
+    else:
+        for line in (adapters or "").splitlines():
+            if re.search(r"cloudflare|warp", line, re.I) and \
+                    re.search(r"\b(Disabled|Not Present)\b", line, re.I):
+                findings.append("WARP's own adapter is not up: %s" % line.strip())
+
+    rc, tasks = run(["tasklist", "/fo", "csv", "/nh"], timeout=40)
+    seen = set()
+    for line in hits(tasks, PROXY_PROCESS_HINTS):
+        name = line.split(",")[0].strip('"')
+        if name.lower() not in seen:
+            seen.add(name.lower())
+            findings.append("VPN/proxy process running: %s" % name)
+
+    rc, out = run(["netsh", "winhttp", "show", "proxy"], timeout=20)
+    if rc == 0 and out and "Direct access" not in out and "DIRECT" not in out.upper():
+        findings.append("System-wide (WinHTTP) proxy is set: %s"
+                        % " ".join(out.split())[:120])
+
+    rc, out = run(["reg", "query",
+                   r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                   "/v", "ProxyServer"], timeout=20)
+    if rc == 0 and out:
+        m = re.search(r"ProxyServer\s+REG_SZ\s+(\S+)", out)
+        if m:
+            findings.append("Windows proxy setting points at %s" % m.group(1))
+
+    rc, out = run(["netsh", "advfirewall", "show", "allprofiles"], timeout=20)
+    if rc == 0 and re.search(r"Outbound connections.*Block", out or "", re.I):
+        findings.append("Windows Firewall is set to BLOCK outbound connections "
+                        "by default - WARP needs an outbound UDP allow rule")
+
+    if findings:
+        for f in findings:
+            log("  !! " + f)
+    elif src == "unavailable":
+        log("  (nothing obvious in what could be read)")
+    else:
+        log("  (nothing obvious - no VPN/proxy adapters, no proxy processes,")
+        log("   no system proxy, firewall not blocking outbound by default)")
+    return findings
+
+
 def udp_diagnosis():
     """Probe the ports WARP's tunnel actually needs. Returns a verdict key."""
     log("UDP reachability - this is the one that matters, WARP's tunnel is UDP:")
@@ -512,9 +634,13 @@ def udp_diagnosis():
         log("     edge. Something here is filtering VPN traffic specifically")
         log("     (school / office / hotel networks and some ISPs do this).")
         return "edge-filtered"
-    log("  -> No UDP reply from anywhere, not even a plain DNS query. This")
-    log("     network blocks outbound UDP, and WARP's tunnel is UDP only, so")
-    log("     no setting on this computer can get through it.")
+    log("  -> No UDP reply from anywhere, not even a plain DNS query. WARP's")
+    log("     tunnel is UDP only, so this is the blocker - but it could be")
+    log("     either end of the wire: this network dropping UDP, or something")
+    log("     on this PC eating it before it gets out.")
+    log("     Settle it in one minute: try WARP on a phone or another laptop")
+    log("     on the same Wi-Fi. If that works, the network is fine and the")
+    log("     problem is this PC - see the list above.")
     return "udp-blocked"
 
 
@@ -538,6 +664,8 @@ def network_diagnosis(warp):
     log("  TCP 443 to %-22s : %s" % (API_HOST, "OK" if tcp_ok(API_HOST) else "BLOCKED"))
     log("  TCP 443 to 1.1.1.1              : %s" % ("OK" if tcp_ok("1.1.1.1") else "BLOCKED"))
     log()
+    local = local_interference_report()
+    log()
     verdict = udp_diagnosis()
     log()
     log("Last status:")
@@ -553,22 +681,34 @@ def network_diagnosis(warp):
     log()
     log("Things to try next:")
 
+    # A named suspect on this machine outranks any guess about the network -
+    # especially when UDP is dead, because a TUN proxy produces exactly the
+    # same symptom as a hostile network and is far easier to check.
+    if local:
+        log("  * START HERE: the checks above found %d thing(s) on this PC that"
+            % len(local))
+        log("    can break the tunnel. Quit them properly - a TUN-mode proxy")
+        log("    keeps filtering after its window is closed, so exit it from")
+        log("    the tray, or uninstall it - then REBOOT and try again.")
+        log("    Closing the app is not enough; the filter driver has to go.")
+
     if verdict == "udp-blocked":
-        log("  * THIS IS THE BLOCKER: the network drops outbound UDP. Move to a")
-        log("    different one - a phone hotspot is the quickest test. If WARP")
-        log("    connects there, nothing was ever wrong with this computer.")
-        log("  * If it is your own router, look for a UDP/QUIC or 'VPN")
-        log("    passthrough' setting and allow UDP out on 443 and 2408.")
+        log("  * UDP is not getting through at all. If another device on this")
+        log("    same Wi-Fi connects to WARP, the network is innocent and the")
+        log("    blocker is on this PC: work through the list above, then")
+        log("    check Windows Firewall and any antivirus with a firewall")
+        log("    (McAfee, Norton, 360, Huorong) for a rule on WARP.")
+        log("  * If no other device can connect either, it is the network.")
+        log("    Use a phone hotspot, or allow UDP out on 443 and 2408.")
     elif verdict == "edge-filtered":
-        log("  * THIS IS THE BLOCKER: UDP works, but not to Cloudflare's WARP")
-        log("    edge. That is deliberate filtering by whoever runs this")
-        log("    network. A phone hotspot will confirm it in under a minute.")
+        log("  * UDP works, but nothing comes back from Cloudflare's WARP edge")
+        log("    specifically - either deliberate filtering on this network, or")
+        log("    something on this PC treating WARP's traffic differently.")
+        log("    A phone hotspot tells you which in under a minute.")
     else:
-        log("  * Uninstall other VPN / proxy tools (Clash, v2ray, Radmin VPN,")
-        log("    ...) and reboot - their filter drivers can block the tunnel")
-        log("    even while they look switched off.")
-        log("  * Connect to a different network (e.g. phone hotspot) to rule the")
-        log("    network in or out.")
+        log("  * UDP reaches Cloudflare, so the network is fine and the fault")
+        log("    is on this PC. Other VPN / proxy tools and their filter")
+        log("    drivers are the usual cause; reboot after removing them.")
 
     if proto:
         other = "WireGuard" if proto.lower() == "masque" else "MASQUE"

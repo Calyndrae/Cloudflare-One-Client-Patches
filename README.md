@@ -160,17 +160,44 @@ UDP reachability - this is the one that matters, WARP's tunnel is UDP:
 ```
 
 This is the single most useful thing in the whole report. WARP's tunnel only
-travels over **UDP**, so if those lines say `no reply` everywhere, the network
-you are on is throwing WARP's traffic away and **nothing you change on this
-computer can fix it**. Don't reinstall, don't reset anything — get on a
-different network (a phone hotspot is the quickest test).
+travels over **UDP**, so `no reply` everywhere means you have found the
+blocker — but *not yet* whose fault it is. Two completely different things
+produce identical lines:
 
-If the WARP edge *does* reply, the network is fine and the problem is on the
-PC: another VPN's driver, or the registration.
+- the **network** is dropping UDP, or
+- something on **this PC** is eating it before it ever reaches the wire.
+
+**The one-minute test:** try WARP on your phone or another laptop on the same
+Wi-Fi. If that works, the network is innocent and the problem is this
+computer.
 
 > TCP lines saying `OK` mean almost nothing here. WARP signs in over TCP but
-> tunnels over UDP, which is why the old version of this tool could say
-> "TCP 443 OK" three times while the real blocker went unmentioned.
+> tunnels over UDP — and a TUN-mode proxy will happily carry the TCP while
+> silently dropping the UDP, which is exactly how a local problem disguises
+> itself as a network one.
+
+### 🕵️ …then read the list above them
+
+Just before the UDP block, the tool names what it found on this PC:
+
+```
+Things on this PC that can swallow the tunnel:
+  !! VPN/proxy network adapter: Up  Clash  -  Wintun Userspace Tunnel
+  !! VPN/proxy process running: Clash Verge.exe
+  !! System-wide (WinHTTP) proxy is set: 127.0.0.1:7890
+```
+
+It checks, read-only and changing nothing: TUN/TAP adapters belonging to other
+VPNs and proxies, whether WARP's own adapter is present and up, running
+VPN/proxy processes, the Windows and WinHTTP proxy settings, and whether
+Windows Firewall blocks outbound by default.
+
+**Closing the window is not enough.** Clash, v2ray, Netch, Proxifier, Radmin
+VPN and friends install a filter driver that keeps working after the app looks
+shut. Exit from the tray or uninstall, **then reboot**, then try WARP again.
+
+Antivirus with its own firewall (McAfee — often preinstalled on new laptops —
+Norton, 360, 火绒) can do the same thing, and won't show up as an adapter.
 
 ---
 
@@ -320,9 +347,17 @@ If nothing connects, the script reports:
   through. No server implements that version, so [RFC 9000][rfc9000] obliges it
   to answer with a Version Negotiation packet; any reply proves UDP got there
   and back without the script having to speak the rest of QUIC.
+- **A read-only scan of this machine**, because "the network drops UDP" and "a
+  filter driver here drops UDP" are indistinguishable from the outside:
+  TUN/TAP adapters belonging to other VPNs and proxies (`Get-NetAdapter`,
+  falling back to `netsh interface show interface`), whether WARP's own adapter
+  is present and up, running VPN/proxy processes (`tasklist`), the WinHTTP and
+  WinINET proxy settings, and whether Windows Firewall blocks outbound by
+  default. It names things; it never disables or removes any of them.
 - A verdict drawn from those: `edge-ok` (network is fine, look at this PC),
   `edge-filtered` (UDP works, WARP specifically doesn't) or `udp-blocked` (no
-  UDP at all — no client-side fix exists, change networks).
+  UDP at all — either end of the wire, which the local scan and a second device
+  on the same Wi-Fi disambiguate).
 - Current protocol, mode, whether a registration exists, and the final
   `warp-cli status`.
 
