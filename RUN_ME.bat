@@ -16,6 +16,7 @@ set "REPO_RAW=https://raw.githubusercontent.com/Calyndrae/Cloudflare-One-Client-
 set "PY_VERSION=3.13.7"
 set "SELF=%~f0"
 set "SELFDIR=%~dp0"
+set "SELFARGS=%*"
 
 echo.
 echo   ======================================================
@@ -33,8 +34,16 @@ if not errorlevel 1 goto :is_admin
 echo   Windows is about to ask if this app can make changes to
 echo   your device. Click YES.
 echo.
+if defined SELFARGS goto :elevate_with_args
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "Start-Process -FilePath $env:SELF -Verb RunAs -WorkingDirectory $env:SELFDIR" >nul 2>&1
+goto :elevate_done
+
+:elevate_with_args
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "Start-Process -FilePath $env:SELF -Verb RunAs -ArgumentList $env:SELFARGS -WorkingDirectory $env:SELFDIR" >nul 2>&1
+
+:elevate_done
 if errorlevel 1 (
     echo.
     echo   !! Administrator rights were refused, so nothing was changed.
@@ -106,9 +115,56 @@ echo.
 rem --------------------------------------------------------------------------
 rem  4. Run it (we are already elevated, so tell it not to ask again)
 rem --------------------------------------------------------------------------
-"%PYCMD%" %PYARGS% "%SCRIPT%" --no-elevate --no-pause
+set "EXTRA="
+
+:run_fix
+"%PYCMD%" %PYARGS% "%SCRIPT%" --no-elevate --no-pause %EXTRA% %SELFARGS%
 set "RC=%errorlevel%"
 
+rem  The script tells us what is worth offering next:
+rem    5 = other VPN / proxy software is in the way and can be cleared
+rem    2 = not fixed, machine in one piece, the protocol is the last idea
+rem  Both change things on this PC, so both are asked rather than assumed.
+if "%RC%"=="5" goto :offer_clean
+if "%RC%"=="2" goto :offer_protocol
+goto :done
+
+:offer_clean
+echo %EXTRA% %SELFARGS% | find /i "--clean-tun" >nul
+if not errorlevel 1 goto :offer_protocol
+echo.
+echo   Other VPN / proxy software is standing in WARP's way - the
+echo   details are listed above. This can stop those programs, switch
+echo   off their tunnel adapters and clear the system proxy.
+echo.
+echo   It is reversible: everything is written down first, and
+echo   RUN_ME.bat --restore-tun puts all of it back. If the cleanup
+echo   takes this PC off the internet, it undoes itself immediately.
+echo.
+set "ANSWER="
+set /p "ANSWER=  Clear them out of the way now? [y/N] "
+if /i not "%ANSWER%"=="y" goto :offer_protocol
+set "EXTRA=%EXTRA% --clean-tun"
+echo.
+goto :run_fix
+
+:offer_protocol
+echo %EXTRA% %SELFARGS% | find /i "--try-protocols" >nul
+if not errorlevel 1 goto :done
+echo.
+echo   One thing is left to try: WARP can tunnel over MASQUE or over
+echo   WireGuard, and some networks allow one but block the other.
+echo   Your current setting is put straight back if the other one does
+echo   not connect either.
+echo.
+set "ANSWER="
+set /p "ANSWER=  Try the other tunnel protocol now? [y/N] "
+if /i not "%ANSWER%"=="y" goto :done
+set "EXTRA=%EXTRA% --try-protocols"
+echo.
+goto :run_fix
+
+:done
 echo.
 pause
 exit /b %RC%

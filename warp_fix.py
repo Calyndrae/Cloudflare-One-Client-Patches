@@ -9,13 +9,29 @@ through the fallback ports and never completes.  Re-registering the device
 fixes it.  The script also has a service-restart fallback and a final
 network diagnosis if nothing works.
 
+The other failure this handles is the one the first version of this script
+could cause: warp-cli talks to the WARP service over a local IPC socket, and
+while the service is grinding through a connect attempt it stops answering.
+Registration commands sent into that window come back with "The IPC call hit a
+timeout" *after* they have already half-applied, which can leave the device
+with no registration at all - a worse problem than the one it came here with.
+So the daemon is always quiesced before registration is touched, those calls
+are retried, and a device that ends up unregistered is re-registered before
+the script gives up.
+
 Your settings are left alone.  The tunnel protocol (MASQUE / WireGuard) and
 the WARP mode are read before the device is re-registered and put back
-afterwards if re-registration reset them.  Nothing else is changed.
+afterwards if re-registration reset them.  Nothing else is changed unless you
+pass --try-protocols.
 
 Usage:
-    python warp_fix.py            (auto-prompts for admin via UAC)
-    python warp_fix.py --no-pause (don't wait for Enter at the end)
+    python warp_fix.py                 (auto-prompts for admin via UAC)
+    python warp_fix.py --no-pause      (don't wait for Enter at the end)
+    python warp_fix.py --try-protocols (also try the other tunnel protocol,
+                                        and put yours back if it doesn't help)
+    python warp_fix.py --clean-tun     (stop other VPN/proxy tunnels that are
+                                        eating WARP's UDP - reversible)
+    python warp_fix.py --restore-tun   (undo the above and exit)
 
 Build a standalone self-elevating EXE (on a machine with Python):
     pip install pyinstaller
@@ -46,6 +62,80 @@ WARP_EDGE_IP = "162.159.198.2"
 API_HOST = "api.cloudflareclient.com"
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 CONNECT_WAIT = 30          # seconds to wait for "Connected" after each attempt
+QUIESCE_WAIT = 25          # seconds to wait for the daemon to leave "Connecting"
+
+# warp-cli reaches the WARP service over a local IPC socket.  These are what it
+# prints when the service is too busy connecting to answer - the command has
+# not necessarily failed, it just never got a reply, so it is worth retrying
+# once the daemon is idle rather than treating it as a hard error.
+IPC_BUSY_RE = re.compile(r"IPC call hit a timeout|Error communicating with daemon",
+                         re.I)
+
+# Sent as one UDP datagram each in the final diagnosis.  WARP's tunnel is UDP
+# only, so TCP/443 succeeding says nothing useful; these say everything.
+# Cloudflare serves MASQUE (QUIC) on 443 and falls back to 500/1701/4500, which
+# is exactly the port ladder a stuck client cycles through, so a QUIC probe on
+# each of them mirrors what the client itself is attempting.
+UDP_PROBES = [
+    ("1.1.1.1", 53, "dns", "any UDP at all?"),
+    ("1.1.1.1", 443, "quic", "UDP/443 in general"),
+    (WARP_EDGE_IP, 443, "quic", "WARP edge, main port"),
+    (WARP_EDGE_IP, 500, "quic", "WARP edge, fallback"),
+    (WARP_EDGE_IP, 1701, "quic", "WARP edge, fallback"),
+    (WARP_EDGE_IP, 4500, "quic", "WARP edge, fallback"),
+]
+
+# Names that turn up in the adapter list when a TUN/TAP-based VPN or proxy is
+# installed.  These matter because WARP's tunnel is UDP: a TUN proxy that grabs
+# the default route will happily carry TCP (so every TCP check below passes)
+# and drop the UDP it cannot forward, which looks exactly like a hostile
+# network from the outside.  Matching is on substrings, and "cloudflare" is
+# skipped so WARP's own adapter never reports itself.
+TUNNEL_ADAPTER_HINTS = [
+    "tap-windows", "tap-nordvpn", "tap-proton", "openvpn", "wintun",
+    "wireguard", "nordlynx", "clash", "mihomo", "meta tunnel", "netch",
+    "tun2socks", "surge", "radmin", "hamachi", "zerotier", "tailscale",
+    "expressvpn", "surfshark", "astrill", "softether", "anyconnect",
+    "forticlient", "pangp", "easyconnect", "sangfor", "juniper",
+]
+
+# Processes worth naming if they are running.  Same reasoning: several of these
+# install a WFP filter driver that keeps working after you close the window.
+PROXY_PROCESS_HINTS = [
+    "clash", "mihomo", "verge", "v2ray", "xray", "sing-box", "singbox",
+    "netch", "proxifier", "shadowsocks", "trojan", "hysteria", "nekoray",
+    "nekobox", "qv2ray", "surge", "tun2socks", "openvpn", "radmin",
+    "hamachi", "zerotier", "tailscale", "nordvpn", "expressvpn",
+    "surfshark", "protonvpn", "astrill", "easyconnect", "sangfor",
+    "forticlient", "anyconnect", "softether",
+]
+
+# --clean-tun disables adapters and clears proxy settings.  Everything it does
+# is written here first, so --restore-tun can put it all back.
+UNDO_DIR = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "warp_fix")
+UNDO_PATH = os.path.join(UNDO_DIR, "clean_tun_undo.json")
+
+# The subset of TUNNEL_ADAPTER_HINTS that --clean-tun will actually disable.
+# Corporate VPN clients (AnyConnect, FortiClient, EasyConnect, GlobalProtect,
+# Sangfor ...) are deliberately absent: worth reporting, but disabling one can
+# cut somebody off from the network they work on, and that is not a trade this
+# tool gets to make on their behalf.
+CLEANABLE_ADAPTER_HINTS = [
+    "tap-windows", "tap-nordvpn", "tap-proton", "wintun", "clash", "mihomo",
+    "meta tunnel", "netch", "tun2socks", "surge", "radmin", "hamachi",
+    "zerotier", "tailscale", "nordlynx",
+]
+CLEANABLE_PROCESS_HINTS = [
+    "clash", "mihomo", "verge", "v2ray", "xray", "sing-box", "singbox",
+    "netch", "proxifier", "shadowsocks", "trojan", "hysteria", "nekoray",
+    "nekobox", "qv2ray", "surge", "tun2socks",
+]
+
+# -f avoids nesting quotes inside the PowerShell string; the pipes give us a
+# delimiter no adapter name contains.
+PS_ADAPTERS = ("Get-NetAdapter | ForEach-Object { "
+               "'{0}|{1}|{2}' -f $_.Status, $_.Name, $_.InterfaceDescription }")
+INET_PROXY_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 
 # Tunnel protocols warp-cli understands, keyed by lowercase name so that
 # whatever casing the CLI prints maps back onto a value it will accept.
@@ -72,6 +162,9 @@ MODE_ALIASES = {
 }
 NO_PAUSE = "--no-pause" in sys.argv
 NO_ELEVATE = "--no-elevate" in sys.argv
+TRY_PROTOCOLS = "--try-protocols" in sys.argv
+CLEAN_TUN = "--clean-tun" in sys.argv
+RESTORE_TUN = "--restore-tun" in sys.argv
 
 LOG_PATH = os.path.join(os.environ.get("TEMP", "."), "warp_fix.log")
 _log_fh = None
@@ -153,9 +246,57 @@ class Warp:
     def cmd(self, *args, timeout=60):
         return run([self.cli, "--accept-tos", *args], timeout=timeout)
 
+    @staticmethod
+    def ipc_busy(out):
+        """Did the service fail to answer, rather than answer with a failure?"""
+        return bool(out) and IPC_BUSY_RE.search(out) is not None
+
+    def cmd_retry(self, *args, attempts=3, timeout=60, settle=4):
+        """cmd(), but retried while the service is too busy to reply.
+
+        Only IPC timeouts are retried - a real error from the service is
+        returned as-is on the first try.  Between attempts we ask WARP to stop
+        connecting, because the connect loop is what is monopolising it."""
+        rc, out = -1, ""
+        for attempt in range(1, attempts + 1):
+            rc, out = self.cmd(*args, timeout=timeout)
+            if not self.ipc_busy(out):
+                return rc, out
+            if attempt < attempts:
+                log("   (WARP service busy - stopping the connect attempt and "
+                    "retrying '%s' in %ss)" % (" ".join(args), settle))
+                self.cmd("disconnect", timeout=15)
+                time.sleep(settle)
+                settle *= 2
+        return rc, out
+
     def status(self):
         _, out = self.cmd("status", timeout=20)
         return out
+
+    def state(self, out=None):
+        """The one-word state WARP reports: Connected / Connecting /
+        Disconnected / Unable / None if it will not say."""
+        out = self.status() if out is None else out
+        m = re.search(r"Status update:\s*(\w+)", out or "")
+        return m.group(1) if m else None
+
+    def quiesce(self, seconds=QUIESCE_WAIT):
+        """Stop WARP connecting and wait until it has actually stopped.
+
+        This is the important one.  A registration command issued while the
+        daemon is mid-connect gets no reply, and warp-cli reporting an IPC
+        timeout does not mean the daemon ignored it - `registration delete` can
+        land anyway and leave the device unregistered.  Nothing touches
+        registration until this returns True."""
+        self.cmd("disconnect", timeout=20)
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            st = self.state()
+            if st and st.lower() != "connecting":
+                return True
+            time.sleep(2)
+        return False
 
     def is_connected(self, out=None):
         out = self.status() if out is None else out
@@ -191,6 +332,23 @@ class Warp:
             info["license"] = m.group(1)
         return info
 
+    def registration_present(self):
+        """True / False, or None when the service will not tell us.
+
+        None is treated as "leave it alone" everywhere: registering a device
+        that already has a registration is its own kind of mess, so we only act
+        on a definite no."""
+        rc, out = self.cmd("registration", "show", timeout=20)
+        if re.search(r"Registration Missing|Missing Registration|"
+                     r"not registered|No registration", out or "", re.I):
+            return False
+        if rc == 0 and re.search(r"Device ID|Public Key|Account ID|"
+                                 r"Account type|Registration ID", out or "", re.I):
+            return True
+        if re.search(r"Registration Missing", self.status() or "", re.I):
+            return False
+        return None
+
     # --- settings we must not change -------------------------------------- #
     def settings_text(self):
         _, out = self.cmd("settings", timeout=20)
@@ -219,9 +377,19 @@ class Warp:
         return rc == 0, out
 
     def mode(self):
-        """Current WARP mode as warp-cli spells it, or None if unknown."""
-        m = re.search(r"^\s*Mode\s*[:=]\s*(\S+)", self.settings_text(), re.M)
-        return m.group(1).strip(".,") if m else None
+        """Current WARP mode as warp-cli spells it, or None if unknown.
+
+        How `warp-cli settings` labels the mode has moved around between
+        releases, so try the spellings we have seen.  Failing to read it costs
+        nothing: an unknown mode is never written back."""
+        text = self.settings_text()
+        for pat in (r"^\s*Mode\s*[:=]\s*(\S+)",
+                    r"^\s*WARP mode\s*[:=]\s*(\S+)",
+                    r"^\s*Tunnel mode\s*[:=]\s*(\S+)"):
+            m = re.search(pat, text, re.M | re.I)
+            if m:
+                return m.group(1).strip(".,")
+        return None
 
     def set_mode(self, mode):
         short = MODE_ALIASES.get(mode.lower().replace(" ", ""))
@@ -335,6 +503,374 @@ def tcp_ok(host, port=443, timeout=5):
         return False
 
 
+def udp_probe(host, port, kind, timeout=4):
+    """Send one UDP datagram that a healthy server is obliged to answer.
+
+    "dns"  - a real DNS query for cloudflare.com; a reply carrying our
+             transaction id means UDP got out and back.
+    "quic" - a QUIC long header carrying version 0x0a0a0a0a, which no server
+             implements.  RFC 9000 requires the server to answer with a
+             Version Negotiation packet, so we learn whether UDP reaches the
+             port without having to speak the rest of QUIC.  The datagram is
+             padded to 1200 bytes because servers ignore shorter ones.
+
+    Returns True (answered), False (silence) or None (the send itself failed).
+    """
+    if kind == "dns":
+        txid = os.urandom(2)
+        payload = (txid + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+                   + b"\x0acloudflare\x03com\x00\x00\x01\x00\x01")
+        expect = txid
+    else:
+        dcid, scid = os.urandom(8), os.urandom(8)
+        payload = (b"\xc0\x0a\x0a\x0a\x0a"
+                   + bytes([len(dcid)]) + dcid + bytes([len(scid)]) + scid)
+        payload += b"\x00" * (1200 - len(payload))
+        expect = None
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        sock.sendto(payload, (host, port))
+        data, _ = sock.recvfrom(2048)
+        return expect is None or data[:2] == expect
+    except socket.timeout:
+        return False
+    except OSError:
+        return None
+    finally:
+        if sock is not None:
+            sock.close()
+
+
+def ps(script, timeout=40):
+    """Run a PowerShell one-liner. Returns (rc, output)."""
+    return run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-Command", script], timeout=timeout)
+
+
+def hits(text, hints, skip=("cloudflare", "warp")):
+    """Lines of `text` containing any of `hints`, minus the ones we expect."""
+    found = []
+    for line in (text or "").splitlines():
+        low = line.lower()
+        if not low.strip() or any(s in low for s in skip):
+            continue
+        if any(h in low for h in hints):
+            found.append(line.strip())
+    return found
+
+
+def adapter_list():
+    """([(status, name, description)], source).
+
+    Only rows from Get-NetAdapter carry a name we are willing to act on - the
+    netsh table's column layout is localised, so its names are good enough to
+    show you and not good enough to disable.  An empty list means we could not
+    read the adapters at all, which must never be mistaken for "no adapters"."""
+    rc, out = ps(PS_ADAPTERS)
+    rows = []
+    if rc == 0 and out and "$(" not in out:
+        for line in out.splitlines():
+            parts = line.split("|")
+            if len(parts) >= 3:
+                rows.append((parts[0].strip(), parts[1].strip(),
+                             "|".join(parts[2:]).strip()))
+    if rows:
+        return rows, "Get-NetAdapter"
+
+    rc, out = run(["netsh", "interface", "show", "interface"], timeout=20)
+    if rc == 0 and out:
+        for line in out.splitlines():
+            cols = line.split()
+            if len(cols) >= 4 and not line.startswith("-"):
+                rows.append((cols[1], " ".join(cols[3:]), ""))
+        if rows:
+            return rows[1:], "netsh"      # drop the (localised) header row
+    return [], "unavailable"
+
+
+def local_interference_report():
+    """Report what on *this* PC could be eating WARP's UDP.
+
+    Read-only: this names things, it never disables or uninstalls anything -
+    that is --clean-tun's job, and only when asked.  It runs because "the
+    network drops UDP" and "a filter driver on this machine drops UDP" are
+    indistinguishable from the outside; if another device on the same Wi-Fi
+    connects to WARP, everything worth finding is in here.
+
+    Returns a dict: "findings" for display, plus the structured pieces
+    --clean-tun acts on."""
+    log("Things on this PC that can swallow the tunnel:")
+    report = {"findings": [], "adapters": [], "processes": [],
+              "proxy": False, "actionable": False}
+
+    rows, source = adapter_list()
+    if source == "unavailable":
+        log("  (could not read the network adapter list)")
+    for status, name, desc in rows:
+        blob = ("%s %s" % (name, desc)).lower()
+        if "cloudflare" in blob or "warp" in blob:
+            continue
+        if any(h in blob for h in TUNNEL_ADAPTER_HINTS):
+            report["findings"].append("VPN/proxy network adapter: %s  %s  (%s)"
+                                      % (status, name, desc or "?"))
+            cleanable = (source == "Get-NetAdapter"
+                         and any(h in blob for h in CLEANABLE_ADAPTER_HINTS)
+                         and status.lower() not in ("disabled", "not present"))
+            if cleanable:
+                report["adapters"].append(name)
+
+    # WARP's own adapter going missing or being disabled is its own bug, and
+    # tells you to reinstall rather than to go hunting through the network.
+    warp_rows = [r for r in rows if re.search(r"cloudflare|warp", "%s %s" % (r[1], r[2]), re.I)]
+    if rows and not warp_rows:
+        report["findings"].append(
+            "WARP's own network adapter is not in the adapter list - the "
+            "client's driver did not install or was removed")
+    for status, name, desc in warp_rows:
+        if status.lower() in ("disabled", "not present"):
+            report["findings"].append("WARP's own adapter is %s: %s" % (status, name))
+
+    rc, tasks = run(["tasklist", "/fo", "csv", "/nh"], timeout=40)
+    seen = set()
+    for line in hits(tasks, PROXY_PROCESS_HINTS):
+        name = line.split(",")[0].strip('"')
+        if name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        report["findings"].append("VPN/proxy process running: %s" % name)
+        if any(h in name.lower() for h in CLEANABLE_PROCESS_HINTS):
+            report["processes"].append(name)
+
+    rc, out = run(["netsh", "winhttp", "show", "proxy"], timeout=20)
+    if rc == 0 and out and "Direct access" not in out and "DIRECT" not in out.upper():
+        report["findings"].append("System-wide (WinHTTP) proxy is set: %s"
+                                  % " ".join(out.split())[:120])
+        report["proxy"] = True
+
+    rc, out = run(["reg", "query", INET_PROXY_KEY, "/v", "ProxyServer"], timeout=20)
+    if rc == 0 and out:
+        m = re.search(r"ProxyServer\s+REG_SZ\s+(\S+)", out)
+        if m:
+            report["findings"].append("Windows proxy setting points at %s" % m.group(1))
+            report["proxy"] = True
+
+    rc, out = run(["netsh", "advfirewall", "show", "allprofiles"], timeout=20)
+    if rc == 0 and re.search(r"Outbound connections.*Block", out or "", re.I):
+        report["findings"].append(
+            "Windows Firewall is set to BLOCK outbound connections by default "
+            "- WARP needs an outbound UDP allow rule")
+
+    report["actionable"] = bool(report["adapters"] or report["processes"]
+                                or report["proxy"])
+    if report["findings"]:
+        for f in report["findings"]:
+            log("  !! " + f)
+    elif source == "unavailable":
+        log("  (nothing obvious in what could be read)")
+    else:
+        log("  (nothing obvious - no VPN/proxy adapters, no proxy processes,")
+        log("   no system proxy, firewall not blocking outbound by default)")
+    return report
+
+
+def undo_write(data):
+    """Record what we are about to change, before we change it."""
+    try:
+        os.makedirs(UNDO_DIR, exist_ok=True)
+        with open(UNDO_PATH, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        return True
+    except OSError as e:
+        log("!! Could not write the undo file (%s) - not going to change" % e)
+        log("   anything I cannot put back.")
+        return False
+
+
+def undo_read():
+    try:
+        with open(UNDO_PATH, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def set_adapter(name, enabled):
+    """Enable/disable one adapter by name. Returns (ok, message)."""
+    rc, out = ps("%s-NetAdapter -Name '%s' -Confirm:$false"
+                 % ("Enable" if enabled else "Disable", name.replace("'", "''")))
+    if rc == 0:
+        return True, ""
+    rc2, out2 = run(["netsh", "interface", "set", "interface",
+                     "name=%s" % name,
+                     "admin=%s" % ("enable" if enabled else "disable")], timeout=30)
+    return rc2 == 0, (out2 or out or "failed")
+
+
+def internet_ok():
+    """Is there still a way off this machine?"""
+    return tcp_ok("1.1.1.1") or tcp_ok(API_HOST)
+
+
+def restore_tun(announce=True):
+    """Undo everything the last --clean-tun did."""
+    undo = undo_read()
+    if not undo:
+        if announce:
+            log("Nothing to restore - no undo file at %s" % UNDO_PATH)
+        return False
+    step("Restoring what --clean-tun changed")
+    log("Undo file written %s" % undo.get("when", "(unknown)"))
+
+    for name in undo.get("adapters", []):
+        ok, out = set_adapter(name, True)
+        log("  re-enable adapter %-22s : %s" % (name, "OK" if ok else out))
+
+    if undo.get("winhttp"):
+        rc, out = run(["netsh", "winhttp", "set", "proxy", undo["winhttp"]], timeout=20)
+        log("  WinHTTP proxy back to %-18s : %s"
+            % (undo["winhttp"], "OK" if rc == 0 else (out or "failed")))
+    if undo.get("inet_proxy"):
+        rc, _ = run(["reg", "add", INET_PROXY_KEY, "/v", "ProxyServer",
+                     "/t", "REG_SZ", "/d", undo["inet_proxy"], "/f"], timeout=20)
+        log("  Windows proxy back to %-18s : %s"
+            % (undo["inet_proxy"], "OK" if rc == 0 else "failed"))
+    raw = undo.get("inet_enable")
+    if raw:
+        try:
+            num = int(raw, 16) if str(raw).lower().startswith("0x") else int(raw)
+        except ValueError:
+            num = None
+        if num is not None:
+            run(["reg", "add", INET_PROXY_KEY, "/v", "ProxyEnable",
+                 "/t", "REG_DWORD", "/d", str(num), "/f"], timeout=20)
+
+    log("Restored. Processes that were stopped are not restarted - launch them")
+    log("again yourself if you want them back.")
+    try:
+        os.remove(UNDO_PATH)
+    except OSError:
+        pass
+    return True
+
+
+def clean_tun(report):
+    """Clear other VPN/proxy tunnels out of WARP's way. Only with --clean-tun.
+
+    Reversible by design.  Every adapter this disables and every proxy setting
+    it clears is written to UNDO_PATH *before* the change, so --restore-tun can
+    put it all back even if this run dies half way.  And if the machine loses
+    its internet connection as a result, everything goes back immediately
+    without waiting to be asked: a tool that takes you offline while repairing
+    your VPN has not helped anybody.
+
+    What it cannot promise is a *complete* clean.  These tools install a WFP
+    filter driver that only goes away when the application itself is
+    uninstalled; disabling the adapter stops it carrying traffic, which is what
+    WARP needs, but the driver stays on disk until you remove the app."""
+    step("Clearing other VPN / proxy tunnels out of the way (--clean-tun)")
+    if not report.get("actionable"):
+        log("Nothing to clean here - no other TUN/TAP adapter, no proxy process")
+        log("and no system proxy was found.")
+        return False
+
+    undo = {"when": dt.datetime.now().isoformat(timespec="seconds"),
+            "adapters": list(report["adapters"]), "winhttp": None,
+            "inet_proxy": None, "inet_enable": None}
+
+    rc, out = run(["netsh", "winhttp", "show", "proxy"], timeout=20)
+    m = re.search(r"Proxy Server\(s\)\s*:\s*(\S+)", out or "")
+    if m:
+        undo["winhttp"] = m.group(1)
+    rc, out = run(["reg", "query", INET_PROXY_KEY, "/v", "ProxyServer"], timeout=20)
+    m = re.search(r"ProxyServer\s+REG_SZ\s+(\S+)", out or "")
+    if m:
+        undo["inet_proxy"] = m.group(1)
+    rc, out = run(["reg", "query", INET_PROXY_KEY, "/v", "ProxyEnable"], timeout=20)
+    m = re.search(r"ProxyEnable\s+REG_DWORD\s+(\S+)", out or "")
+    if m:
+        undo["inet_enable"] = m.group(1)
+
+    if not undo_write(undo):
+        return False
+
+    for name in report["processes"]:
+        rc, out = run(["taskkill", "/IM", name, "/T"], timeout=30)
+        if rc != 0:
+            rc, out = run(["taskkill", "/IM", name, "/T", "/F"], timeout=30)
+        log("  stop process %-27s : %s" % (name, "OK" if rc == 0 else "not running"))
+
+    disabled = []
+    for name in report["adapters"]:
+        ok, out = set_adapter(name, False)
+        log("  disable adapter %-24s : %s" % (name, "OK" if ok else out))
+        if ok:
+            disabled.append(name)
+    undo["adapters"] = disabled
+    undo_write(undo)
+
+    if report.get("proxy"):
+        rc, out = run(["netsh", "winhttp", "reset", "proxy"], timeout=20)
+        log("  clear WinHTTP proxy %-20s : %s" % ("", "OK" if rc == 0 else "failed"))
+        rc, out = run(["reg", "add", INET_PROXY_KEY, "/v", "ProxyEnable",
+                       "/t", "REG_DWORD", "/d", "0", "/f"], timeout=20)
+        log("  turn off Windows proxy %-17s : %s" % ("", "OK" if rc == 0 else "failed"))
+
+    run(["ipconfig", "/flushdns"], timeout=20)
+    time.sleep(3)
+
+    if not internet_ok():
+        log()
+        log("!! That took this machine off the internet - putting it all back.")
+        restore_tun(announce=False)
+        return False
+
+    log()
+    log("Cleared. Undo written to %s" % UNDO_PATH)
+    log("Put everything back at any time with:  warp_fix.py --restore-tun")
+    log("This disabled the adapters; it did not uninstall the filter drivers")
+    log("those tools install. For a complete clean, uninstall the app and")
+    log("reboot - a driver stays loaded until then.")
+    return True
+
+
+def udp_diagnosis():
+    """Probe the ports WARP's tunnel actually needs. Returns a verdict key."""
+    log("UDP reachability - this is the one that matters, WARP's tunnel is UDP:")
+    results = []
+    for host, port, kind, note in UDP_PROBES:
+        answered = udp_probe(host, port, kind)
+        word = {True: "reply", False: "no reply",
+                None: "no route / refused"}[answered]
+        log("  UDP %-4s to %-15s (%-20s) : %s" % (port, host, note, word))
+        results.append((host, port, answered))
+
+    edge_ok = any(a for h, _, a in results if h == WARP_EDGE_IP)
+    quic_ok = any(a for h, p, a in results if p != 53)
+    dns_ok = any(a for _, p, a in results if p == 53)
+
+    log()
+    if edge_ok:
+        log("  -> UDP does reach Cloudflare's WARP edge, so this network is not")
+        log("     what is blocking the tunnel. Suspect something on this PC:")
+        log("     another VPN's filter driver, or a broken registration.")
+        return "edge-ok"
+    if quic_ok or dns_ok:
+        log("  -> UDP leaves this network, but nothing comes back from the WARP")
+        log("     edge. Something here is filtering VPN traffic specifically")
+        log("     (school / office / hotel networks and some ISPs do this).")
+        return "edge-filtered"
+    log("  -> No UDP reply from anywhere, not even a plain DNS query. WARP's")
+    log("     tunnel is UDP only, so this is the blocker - but it could be")
+    log("     either end of the wire: this network dropping UDP, or something")
+    log("     on this PC eating it before it gets out.")
+    log("     Settle it in one minute: try WARP on a phone or another laptop")
+    log("     on the same Wi-Fi. If that works, the network is fine and the")
+    log("     problem is this PC - see the list above.")
+    return "udp-blocked"
+
+
 def trace_check():
     """Ask Cloudflare whether traffic is going through WARP. Returns dict or None."""
     try:
@@ -349,9 +885,15 @@ def trace_check():
 
 def network_diagnosis(warp):
     step("Network diagnosis (WARP still not connecting)")
-    log("TCP 443 to WARP edge %s : %s" % (WARP_EDGE_IP, "OK" if tcp_ok(WARP_EDGE_IP) else "BLOCKED"))
-    log("TCP 443 to %-22s : %s" % (API_HOST, "OK" if tcp_ok(API_HOST) else "BLOCKED"))
-    log("TCP 443 to 1.1.1.1              : %s" % ("OK" if tcp_ok("1.1.1.1") else "BLOCKED"))
+    log("TCP 443 - the control plane. WARP signs in over this, but the tunnel")
+    log("does not use it, so an OK here does not mean the tunnel can work:")
+    log("  TCP 443 to WARP edge %s : %s" % (WARP_EDGE_IP, "OK" if tcp_ok(WARP_EDGE_IP) else "BLOCKED"))
+    log("  TCP 443 to %-22s : %s" % (API_HOST, "OK" if tcp_ok(API_HOST) else "BLOCKED"))
+    log("  TCP 443 to 1.1.1.1              : %s" % ("OK" if tcp_ok("1.1.1.1") else "BLOCKED"))
+    log()
+    local = local_interference_report()
+    log()
+    verdict = udp_diagnosis()
     log()
     log("Last status:")
     for l in warp.status().splitlines():
@@ -359,23 +901,64 @@ def network_diagnosis(warp):
     log()
     proto = warp.tunnel_protocol()
     mode = warp.mode()
-    log("Tunnel protocol: %s   |   Mode: %s"
-        % (proto or "(unknown)", mode or "(unknown)"))
+    registered = warp.registration_present()
+    log("Tunnel protocol: %s   |   Mode: %s   |   Registered: %s"
+        % (proto or "(unknown)", mode or "(unknown)",
+           {True: "yes", False: "NO", None: "(unknown)"}[registered]))
     log()
     log("Things to try next:")
-    log("  * Connect to a different network (e.g. phone hotspot). If WARP works")
-    log("    there, this network is blocking UDP/VPN traffic and no client-side")
-    log("    fix will help.")
-    log("  * Uninstall other VPN / proxy tools (Clash, v2ray, Radmin VPN, ...)")
-    log("    and reboot - their filter drivers can block the WARP tunnel.")
+
+    # A named suspect on this machine outranks any guess about the network -
+    # especially when UDP is dead, because a TUN proxy produces exactly the
+    # same symptom as a hostile network and is far easier to check.
+    if local["findings"]:
+        log("  * START HERE: the checks above found %d thing(s) on this PC that"
+            % len(local["findings"]))
+        log("    can break the tunnel. Quit them properly - a TUN-mode proxy")
+        log("    keeps filtering after its window is closed, so exit it from")
+        log("    the tray, or uninstall it - then REBOOT and try again.")
+        log("    Closing the app is not enough; the filter driver has to go.")
+    if local["actionable"] and not CLEAN_TUN:
+        log("  * Or let this tool do it: re-run with --clean-tun. It stops the")
+        log("    proxy processes, disables their tunnel adapters and clears the")
+        log("    system proxy, writing an undo file first - --restore-tun puts")
+        log("    every bit of it back, and it self-restores immediately if the")
+        log("    machine loses its connection.")
+
+    if verdict == "udp-blocked":
+        log("  * UDP is not getting through at all. If another device on this")
+        log("    same Wi-Fi connects to WARP, the network is innocent and the")
+        log("    blocker is on this PC: work through the list above, then")
+        log("    check Windows Firewall and any antivirus with a firewall")
+        log("    (McAfee, Norton, 360, Huorong) for a rule on WARP.")
+        log("  * If no other device can connect either, it is the network.")
+        log("    Use a phone hotspot, or allow UDP out on 443 and 2408.")
+    elif verdict == "edge-filtered":
+        log("  * UDP works, but nothing comes back from Cloudflare's WARP edge")
+        log("    specifically - either deliberate filtering on this network, or")
+        log("    something on this PC treating WARP's traffic differently.")
+        log("    A phone hotspot tells you which in under a minute.")
+    else:
+        log("  * UDP reaches Cloudflare, so the network is fine and the fault")
+        log("    is on this PC. Other VPN / proxy tools and their filter")
+        log("    drivers are the usual cause; reboot after removing them.")
+
     if proto:
         other = "WireGuard" if proto.lower() == "masque" else "MASQUE"
         log("  * Some networks pass one tunnel protocol and block the other. You")
-        log("    are on %s; switching to %s in the WARP app (Settings >" % (proto, other))
-        log("    Advanced > Connection options) may get you through. This tool")
-        log("    deliberately does not change that setting for you.")
+        log("    are on %s. Re-run this tool with --try-protocols to let it try" % proto)
+        log("    %s and put %s straight back if that does not help, or switch" % (other, proto))
+        log("    by hand in the app: Settings > Advanced > Connection options.")
+        log("    Without that flag the tool never touches this setting.")
+    if registered is False:
+        log("  * This device currently has NO WARP registration, so the app will")
+        log("    show its first-run screen. Pick the LEFT card (1.1.1.1 /")
+        log("    private browsing) unless your workplace or school gave you a")
+        log("    Cloudflare One team name - the right-hand card asks for that")
+        log("    team login and cannot be used without one.")
     log("  * Reinstall WARP from https://1.1.1.1/ and run this script again.")
     log("  * Full log: %s" % LOG_PATH)
+    return local
 
 
 # --------------------------------------------------------------------------- #
@@ -387,8 +970,64 @@ def attempt_plain_connect(warp):
     return warp.wait_connected(20)
 
 
-def attempt_reregister(warp, snap):
-    step("Step 2/3: re-register device (fixes expired registration)")
+def register_new(warp, timeout=90):
+    """`registration new`, falling back to the older CLI's `register`."""
+    rc, out = warp.cmd_retry("registration", "new", timeout=timeout)
+    if re.search(r"unrecognized subcommand|unexpected argument|invalid subcommand",
+                 out or "", re.I):
+        rc, out = warp.cmd_retry("register", timeout=timeout)
+    return rc, out
+
+
+def ensure_registration(warp):
+    """Never hand the machine back in a worse state than we found it.
+
+    A registration command that the service never acknowledged can still have
+    landed, so a run that fails can leave the device with no registration at
+    all.  WARP then reports "Registration Missing" and the app falls back to
+    its first-run screen - a worse problem than the stuck connect this tool
+    came to fix.  So we try harder for a registration than for the connection
+    itself, and say exactly how to get one back if we cannot."""
+    if warp.registration_present() is not False:
+        return True
+    if getattr(warp, "repair_failed", False):
+        log("(Still unregistered - see the repair section above.)")
+        return False
+
+    step("Repair: this device has been left without a WARP registration")
+    log("Nothing can connect without one, so this gets fixed before we give up.")
+    for attempt in (1, 2):
+        warp.quiesce()
+        rc, out = register_new(warp)
+        log("registration new -> %s" % (out or rc))
+        if warp.registration_present() is not False:
+            log("Registration restored.")
+            return True
+        if attempt == 1:
+            log("Restarting the WARP service and trying once more ...")
+            restart_service()
+
+    log("!! Could not register this device again - Cloudflare's API is not")
+    log("   reachable from this network.")
+    log("   Once you are on a network that works, either open the WARP app and")
+    log("   answer its first-run screen, or run this one line as administrator:")
+    log('     "%s" --accept-tos registration new' % warp.cli)
+    warp.repair_failed = True
+    return False
+
+
+def attempt_reregister(warp, snap, delete_first=True):
+    step("Step 2/3: re-register device (fixes an expired or missing registration)")
+
+    # The service stops answering while it is grinding through a connect
+    # attempt, and a registration command sent into that window can half-apply
+    # - which is how a device ends up unregistered. Stop the loop first.
+    if not warp.quiesce():
+        log("WARP is still stuck in its connect loop; restarting the service to")
+        log("get its attention before touching the registration.")
+        restart_service()
+        warp.quiesce()
+
     info = warp.registration_info()
     acct = info["account_type"] or "unknown"
     lic = info["license"]
@@ -398,18 +1037,18 @@ def attempt_reregister(warp, snap):
     else:
         lic = None
 
-    warp.cmd("disconnect")
-    time.sleep(1)
-    rc, out = warp.cmd("registration", "delete")
-    log("registration delete -> %s" % (out or rc))
-    time.sleep(2)
-    rc, out = warp.cmd("registration", "new", timeout=90)
+    if delete_first:
+        rc, out = warp.cmd_retry("registration", "delete")
+        log("registration delete -> %s" % (out or rc))
+        time.sleep(2)
+
+    rc, out = register_new(warp)
     log("registration new    -> %s" % (out or rc))
-    if rc != 0 or "Success" not in out:
+    if warp.registration_present() is False:
         log("!! Registration failed. WARP's API may be unreachable from this network.")
         return False
     if lic:
-        rc, out = warp.cmd("registration", "license", lic, timeout=60)
+        rc, out = warp.cmd_retry("registration", "license", lic, timeout=60)
         log("re-apply license    -> %s" % (out or rc))
     # A fresh registration can come back on WARP's defaults - put the user's
     # own tunnel protocol and mode back rather than leaving ours in place.
@@ -424,8 +1063,43 @@ def attempt_service_restart(warp):
     if not restart_service():
         log("!! Service did not come back up.")
         return False
+    # A restart on a device whose registration went missing will just fail
+    # again with "Registration Missing due to: Daemon Startup", so get one
+    # back first.
+    ensure_registration(warp)
     warp.cmd("connect")
     return warp.wait_connected()
+
+
+def attempt_other_protocol(warp, snap):
+    """Only ever runs with --try-protocols, and puts the user's choice back."""
+    step("Extra step: try the other tunnel protocol (--try-protocols)")
+    current = warp.tunnel_protocol()
+    if not current:
+        log("Cannot read the current tunnel protocol, so it will not be changed.")
+        return False
+    other = "WireGuard" if current.lower() == "masque" else "MASQUE"
+    log("Some networks pass one protocol and block the other.")
+    log("Switching %s -> %s. If it does not connect, %s goes straight back."
+        % (current, other, current))
+
+    warp.quiesce()
+    ok, out = warp.set_tunnel_protocol(other)
+    if not ok:
+        log("Could not switch protocol: %s" % (out or "failed"))
+        return False
+
+    warp.cmd("connect")
+    if warp.wait_connected():
+        log("Connected on %s - leaving it there." % other)
+        log("Change it back any time in Settings > Advanced > Connection options.")
+        snap["protocol"] = other      # this one was asked for, so keep it
+        return True
+
+    log("%s did not connect either - restoring %s." % (other, current))
+    warp.quiesce()
+    warp.set_tunnel_protocol(current)
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -467,6 +1141,12 @@ def main():
     step("Cloudflare WARP fix  -  stuck on 'Connecting' / 26%")
     log("Log file: %s" % LOG_PATH)
 
+    # Undoing a cleanup must work even on a machine where WARP has since been
+    # uninstalled - it is the user's adapters and proxy settings we are putting
+    # back, and none of that depends on warp-cli being here.
+    if RESTORE_TUN:
+        return 0 if restore_tun() else 1
+
     cli = find_cli()
     if not cli:
         log("!! warp-cli.exe not found. Install Cloudflare WARP from https://1.1.1.1/")
@@ -476,6 +1156,10 @@ def main():
 
     if not ensure_service_running():
         return 1
+
+    if CLEAN_TUN:
+        step("Checking for other VPN / proxy tunnels")
+        clean_tun(local_interference_report())
 
     vu, expired = conf_validity()
     if vu:
@@ -489,12 +1173,21 @@ def main():
     # Read the settings we must hand back unchanged before touching anything.
     snap = warp.snapshot_settings()
 
+    registered = warp.registration_present()
+    if registered is False:
+        log("Registration: MISSING - this device is not registered with WARP.")
+    elif registered:
+        log("Registration: present")
+
     connected = warp.is_connected(st)
     if connected:
         log("Already connected - will just verify below.")
     else:
-        # If the registration is expired or missing, skip straight to re-register.
-        if expired is not False:
+        if registered is False:
+            # Nothing to delete, and deleting nothing errors - register fresh.
+            connected = attempt_reregister(warp, snap, delete_first=False)
+        elif expired is not False:
+            # Expired or unreadable registration: go straight to re-registering.
             connected = attempt_reregister(warp, snap)
         else:
             connected = attempt_plain_connect(warp)
@@ -502,12 +1195,25 @@ def main():
                 connected = attempt_reregister(warp, snap)
         if not connected:
             connected = attempt_service_restart(warp)
+        if not connected and TRY_PROTOCOLS:
+            connected = attempt_other_protocol(warp, snap)
         if not connected:
             warp.restore_settings(snap)
+            # Whatever else failed, do not walk away from an unregistered device.
+            ensure_registration(warp)
 
     if not connected:
-        network_diagnosis(warp)
+        local = network_diagnosis(warp)
         log()
+        if warp.registration_present() is False:
+            log("RESULT: NOT FIXED - and this device has no WARP registration.")
+            log("        See the 'Repair' section above before anything else.")
+            return 4
+        if local["actionable"] and not CLEAN_TUN:
+            log("RESULT: NOT FIXED - but other VPN / proxy software is in the")
+            log("        way. Re-run with --clean-tun to clear it; everything")
+            log("        it changes is undone by --restore-tun.")
+            return 5
         log("RESULT: NOT FIXED")
         return 2
 
